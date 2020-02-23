@@ -45,13 +45,13 @@
 #define PROP_POS          "positon"
 #define PROP_POS_TITLE    "Position"
 
-#define DHT_PIN           16
+#define PIN_DHT           16
 #define PIN_MOTION        17
 #define PIN_L0X           18
 #define PIN_RELAY         19
-#define PIN_ENTRY         36
 #define PIN_SDA           21
 #define PIN_SCL           22
+#define PIN_ENTRY         36
 
 /*
  * I2c == 22, 21
@@ -63,20 +63,23 @@
  */
 volatile unsigned long guiTimeBase        = 0;
 volatile unsigned long gulLastMotionRead  = 0;
+volatile unsigned long gulLoxDuration     = 0;
 volatile int      giEntry            = 0;
 volatile int      giEntryValue       = 0;
 volatile int      giLastEntryValue   = 0;
 
 volatile bool     gbLOXReady         = false;
 volatile bool     gvDuration         = false;
+volatile bool     gbValue            = false;
 volatile bool     gvMotion           = LOW;  
 volatile bool     gvLastMotion       = LOW;  
 String            gsMotionString     = "false";
+volatile  uint16_t giLOX             = 0,
+                  giValue            = 0,
+                  giLastLOXValue     = 0;
 
 volatile float    gfTemperature      = 0.0f, 
                   gfHumidity         = 0.0f,
-                  gfLOX              = 0.0f,
-                  gfLastLOXValue     = 0.0f,
                   gfValue            = 0.0f;
 char              gBuffer[48];             
 char              gcDisplayBuf[48];
@@ -85,7 +88,7 @@ float             value = 0.0;
 /*
  * Temperature Sensor
 */	
-DHT dht(DHT_PIN, DHT_TYPE);
+DHT dht(PIN_DHT, DHT_TYPE);
 
 /*
  * Time of Flight Sensor
@@ -94,7 +97,7 @@ VL53L0X lox;
 
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 
-void loxInterruptHandler()
+void IRAM_ATTR loxInterruptHandler()
 {
   gbLOXReady = true; // set the new data ready flag to true on interrupt
 }
@@ -105,7 +108,9 @@ bool broadcastHandler(const String& level, const String& value) {
 }
 
 bool operateDoor(const HomieRange& range, const String& value) {
+  Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == "ON" || value=="true" || value == "on") {
+    gulLoxDuration = millis() + 30000; // read for 30 seconds
     digitalWrite(PIN_RELAY, HIGH );
     garageNode.setProperty(PROP_RELAY).send( "ON" );
     delay(250);
@@ -117,17 +122,17 @@ bool operateDoor(const HomieRange& range, const String& value) {
 
 void handleLOX() {
   if (gbLOXReady) {
-    gfValue =  lox.readRangeContinuousMillimeters();
+    giLOX =  lox.readRangeContinuousMillimeters();
     if (lox.timeoutOccurred()) { 
       Homie.getLogger() << "VL53L0X TIMEOUT" << endl;
     } else {
-      Homie.getLogger() << "VL53L0X Reading: " << gfLOX << endl;
-      gfLastLOXValue = gfLOX;
-      gbLOXReady = false;
+      Homie.getLogger() << "VL53L0X Reading: " << giLOX << endl;
+      giLastLOXValue = giLOX;
 
-      snprintf(gBuffer, sizeof(gBuffer), "%.1f", gfLastLOXValue);
+      snprintf(gBuffer, sizeof(gBuffer), "%d", giLastLOXValue);
       garageNode.setProperty(PROP_POS).send(gBuffer);
     }
+    gbLOXReady = false;
   }
 }
 
@@ -214,34 +219,41 @@ void loopHandler() {
     handleMotion(gvMotion);    
   }
 
-  handleLOX(); // Interrupt Driven Handler
+  if (gbLOXReady && gulLoxDuration >= guiTimeBase) {
+    handleLOX(); // Interrupt Driven Handler
+  }
 }
-
 
 void setupHandler() {
    dht.begin();
+   yield();
+   
    Wire.begin(PIN_SDA, PIN_SCL, 400000);
+   yield();
+
+   delay(2000);
 
   lox.setTimeout(500);
-  if (!lox.init())
+  // lox.setAddress(0x52);
+  gbValue = lox.init();
+  if (!gbValue)
   {
     Serial.println("Failed to detect and initialize sensor!");
-    while (1) {} // todo find a better exit
+    // while (1) {} // todo find a better exit
   }
 
-  // lower the return signal rate limit (default is 0.25 MCPS)
+  /*
+   * lower the return signal rate limit (default is 0.25 MCPS)
+   * increase laser pulse periods (defaults are 14 and 10 PCLKs)
+   * increase timing budget to 200 ms
+   * Use continuous timed mode and provide the desired 
+   * inter-measurement period in ms (e.g. sensor.startContinuous(250)).
+  */
   lox.setSignalRateLimit(0.1);
-  // increase laser pulse periods (defaults are 14 and 10 PCLKs)
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
-   // increase timing budget to 200 ms
   lox.setMeasurementTimingBudget(200000);
-
-  // Start continuous back-to-back mode (take readings as
-  // fast as possible).  To use continuous timed mode
-  // instead, provide a desired inter-measurement period in
-  // ms (e.g. sensor.startContinuous(250)).
-  lox.startContinuous(250);
+  lox.startContinuous(50); // total should be around 250ms per reading
 }
 
 void setup() {
@@ -250,10 +262,11 @@ void setup() {
   Serial << endl << endl;
   yield();
 
-  pinMode(PIN_ENTRY, INPUT);     // analog sensor of IR door break 20.0vdc = off, 21.5vdc = on
-  pinMode(PIN_MOTION, INPUT);    // RCWL sensor
-  pinMode(PIN_RELAY, OUTPUT);    // Door operator
-  digitalWrite(PIN_RELAY, LOW);  // Init door to off
+  pinMode(PIN_ENTRY,  INPUT);     // analog sensor of IR door break 20.0vdc = off, 21.5vdc = on
+  pinMode(PIN_MOTION, INPUT);     // RCWL sensor
+  pinMode(PIN_L0X,    INPUT);     // VL53L0X Interrupt Ready Pin
+  pinMode(PIN_RELAY, OUTPUT);     // Door operator
+  digitalWrite(PIN_RELAY, LOW);   // Init door to off
   yield();
    
   Homie_setFirmware(SKN_MOD_NAME, SKN_MOD_VERSION);
