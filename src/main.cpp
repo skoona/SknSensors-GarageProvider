@@ -5,16 +5,21 @@
  *  Created:  02/22/2020
  *  
  *  Description:
- *  At sensorsInterval (15 min) send Temperature, Humidity, 
- *  - Motion, EntryCount, and Door Position.
+ *  At sensorsInterval (15 min) send 
+ *  - Temperature, Humidity, Motion, EntryCount, and Door Position.
  *  When humans are detected send notice once per stats interval, interval will reset
  *  When analog change from saftey beam, record entry/exit.
- *  When position change by 4% broadcast door position until movement stops inside 4%
+ *  When door operates broadcast door position change by 4% for 30 seconds until movement stops
  *  - maybe decode moving up or down, and open/closed from home/max
- *  On handler command pulse Relay to open/close door opener
+ *  On handler command pulse Relay to open/close door opener, and reset position timer
+ *  Position uses an interrupt to read data, disable VL53L0X when not in used by ignoring it, as shutdown resets device
+ *  - also attach/detach interrupt with WiFi enablement and/or non-use
  */
 
 #include <Arduino.h>
+
+#include <driver/adc.h>
+
 #include <Homie.h>
 
 #include <Adafruit_Sensor.h>
@@ -25,7 +30,7 @@
 
 
 
-#define SKN_MOD_NAME    "GarageDoorManager"
+#define SKN_MOD_NAME    "GarageDoor"
 #define SKN_MOD_VERSION "0.1.0"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Door Operations"
@@ -61,19 +66,17 @@
 /*
  * Sensor Values
  */
-volatile unsigned long guiTimeBase        = 0;
-volatile unsigned long gulLastMotionRead  = 0;
-volatile unsigned long gulLoxDuration     = 0;
-volatile int      giEntry            = 0;
-volatile int      giEntryValue       = 0;
-volatile int      giLastEntryValue   = 0;
-
-volatile bool     gbLOXReady         = false;
-volatile bool     gvDuration         = false;
-volatile bool     gbValue            = false;
-volatile bool     gvMotion           = LOW;  
-volatile bool     gvLastMotion       = LOW;  
-String            gsMotionString     = "false";
+volatile unsigned long guiTimeBase   = 0,
+                  gulLastMotionRead  = 0,
+                  gulLoxDuration     = 0;
+volatile int      giEntry            = 0,
+                  giEntryValue       = 0,
+                  giLastEntryValue   = 0;
+volatile bool     gbLOXReady         = false,
+                  gvDuration         = false,
+                  gbValue            = false,
+                  gvMotion           = false,  
+                  gvLastMotion       = false;
 volatile  uint16_t giLOX             = 0,
                   giValue            = 0,
                   giLastLOXValue     = 0;
@@ -81,9 +84,11 @@ volatile  uint16_t giLOX             = 0,
 volatile float    gfTemperature      = 0.0f, 
                   gfHumidity         = 0.0f,
                   gfValue            = 0.0f;
-char              gBuffer[48];             
-char              gcDisplayBuf[48];
+
 float             value = 0.0;
+String            gsMotionString     = "false";
+char              gBuffer[48],
+                  gcDisplayBuf[48];
 
 /*
  * Temperature Sensor
@@ -107,39 +112,63 @@ bool broadcastHandler(const String& level, const String& value) {
   return true;
 }
 
-bool operateDoor(const HomieRange& range, const String& value) {
+bool operateDoorHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == "ON" || value=="true" || value == "on") {
     gulLoxDuration = millis() + 30000; // read for 30 seconds
-    digitalWrite(PIN_RELAY, HIGH );
+
+    digitalWrite(PIN_RELAY, LOW );
     garageNode.setProperty(PROP_RELAY).send( "ON" );
     delay(250);
-    digitalWrite(PIN_RELAY, LOW );
+    digitalWrite(PIN_RELAY, HIGH );
     garageNode.setProperty(PROP_RELAY).send( "OFF" );
   } 
   return true;
 }
 
+int smoothDoorPosition() { // average every 3 readings
+  static uint16_t values[4] = {0,0,0,0};
+  static uint16_t index = 0;
+
+  uint16_t value =  lox.readRangeContinuousMillimeters(); // read data value
+  if (!lox.timeoutOccurred()) {
+    if (index < 3) {
+      values[index++] = value;
+      return 0;
+    } else if (index > 2) { // third new value
+      if (values[3] != 0) {
+        giLastLOXValue = (uint16_t)(((uint32_t)(values[0] + values[1] + values[2] + values[3])) / 4);
+      } else {
+        giLastLOXValue = (uint16_t)(((uint32_t)(values[0] + values[1] + values[2])) / 3);
+      }
+      index = 0;    
+      values[3] = giLastLOXValue;
+      values[index++] = value;
+      return giLastLOXValue;
+    }
+  }
+  return 0; // no value
+}
+
 void handleLOX() {
   if (gbLOXReady) {
-    giLOX =  lox.readRangeContinuousMillimeters();
-    if (lox.timeoutOccurred()) { 
-      Homie.getLogger() << "VL53L0X TIMEOUT" << endl;
-    } else {
+    giLOX = smoothDoorPosition();
+    if (0 != giLOX) {
       Homie.getLogger() << "VL53L0X Reading: " << giLOX << endl;
-      giLastLOXValue = giLOX;
-
-      snprintf(gBuffer, sizeof(gBuffer), "%d", giLastLOXValue);
+      snprintf(gBuffer, sizeof(gBuffer), "%d", giLOX);
       garageNode.setProperty(PROP_POS).send(gBuffer);
     }
     gbLOXReady = false;
-  }
+  }   
 }
 
-void handleEntry() {
+void handleEntryAndPosition() {
   Homie.getLogger() << "Entries: " << giEntryValue << endl;
   garageNode.setProperty(PROP_ENTRY).send(String(giEntryValue));                                        
   giLastEntryValue = 0;
+
+  Homie.getLogger() << "Position: " << giLastLOXValue << endl;
+  garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
 }
 
 void handleMotion(bool state) { // called on demand trigger once per status interval
@@ -186,7 +215,7 @@ void onHomieEvent(const HomieEvent& event) {
     case HomieEventType::SENDING_STATISTICS:
       Serial << "Sending statistics" << endl;
       handleMotion(gvMotion);
-      handleEntry();
+      handleEntryAndPosition();
       handleTemperature();
       break;
     default:
@@ -205,7 +234,9 @@ void loopHandler() {
     gvMotion = digitalRead(PIN_MOTION);
     gulLastMotionRead = guiTimeBase;
     
-    giEntry = analogRead(PIN_ENTRY); 
+    /*
+     * 4.9vdc produces a reading of 1058 ish */
+    giEntry = adc1_get_raw(ADC1_CHANNEL_0); // analogRead(PIN_ENTRY); 
     if ( giEntry >= 900 && giEntry >= giLastEntryValue ) { // 20 to 21.5 volts, 
       giEntryValue++;  
       giLastEntryValue = giEntry;
@@ -234,12 +265,11 @@ void setupHandler() {
    delay(2000);
 
   lox.setTimeout(500);
-  // lox.setAddress(0x52);
   gbValue = lox.init();
   if (!gbValue)
   {
     Serial.println("Failed to detect and initialize sensor!");
-    // while (1) {} // todo find a better exit
+    ESP.restart();
   }
 
   /*
@@ -266,7 +296,19 @@ void setup() {
   pinMode(PIN_MOTION, INPUT);     // RCWL sensor
   pinMode(PIN_L0X,    INPUT);     // VL53L0X Interrupt Ready Pin
   pinMode(PIN_RELAY, OUTPUT);     // Door operator
-  digitalWrite(PIN_RELAY, LOW);   // Init door to off
+  digitalWrite(PIN_RELAY, HIGH);  // Init door to off
+
+  /*
+   * Voltage divider analog in pins
+   * https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
+   * set up A:D channels and attenuation
+   *   * Read the sensor by
+   *   * uint16_t value =  adc1_get_raw(ADC1_CHANNEL_0);
+   *  150mv-3.9vdc inside 0-4095 range   (constrained by 3.3vdc supply)
+  */
+  adc1_config_width(ADC_WIDTH_12Bit);
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // Pin 36
+  
   yield();
    
   Homie_setFirmware(SKN_MOD_NAME, SKN_MOD_VERSION);
@@ -280,7 +322,7 @@ void setup() {
   garageNode.advertise(PROP_RELAY)
             .setName(PROP_RELAY_TITLE)
             .setRetained(true)
-            .settable(operateDoor)
+            .settable(operateDoorHandler)
             .setDatatype("boolean")
             .setFormat("%s");
 
