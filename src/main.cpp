@@ -14,20 +14,34 @@
  *  On handler command pulse Relay to open/close door opener, and reset position timer
  *  Position uses an interrupt to read data, disable VL53L0X when not in used by ignoring it, as shutdown resets device
  *  - also attach/detach interrupt with WiFi enablement and/or non-use
+ * 
+ * 
+    Library Storage: /Users/jscott/ccPlatform/DoorOpener/.pio/libdeps/esp32doit-devkit-v1
+    Updating Adafruit DHT Unified            @ 1.0.0          [Up-to-date]
+    Updating Adafruit GFX Library            @ 1.7.5          [Up-to-date]
+    Updating Adafruit SSD1306                @ 2.2.0          [Up-to-date]
+    Updating Adafruit Unified Sensor         @ 1.1.2          [Up-to-date]
+    Updating ArduinoJson                     @ 6.14.1         [Up-to-date]
+    Updating AsyncMqttClient                 @ 0.8.2          [Up-to-date]
+    Updating AsyncTCP                        @ 1.1.1          [Up-to-date]
+    Updating Bounce2                         @ 2.52           [Up-to-date]
+    Updating DHT sensor library              @ 1.3.8          [Up-to-date]
+    Updating ESP Async WebServer             @ 1.2.3          [Up-to-date]
+    Updating ESPAsyncTCP                     @ 1.2.2          [Up-to-date]
+    Updating Homie                           @ 3.0.0          [Up-to-date]
+    Updating VL53L0X                         @ 1.2.0          [Up-to-date]
+ * 
  */
 
 #include <Arduino.h>
-
 #include <driver/adc.h>
+#include <Wire.h>
+#include "SSD1306Wire.h"
 
 #include <Homie.h>
-
+#include <VL53L0X.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
-
-#include <Wire.h>
-#include <VL53L0X.h>
-
 
 
 #define SKN_MOD_NAME    "GarageDoor"
@@ -100,6 +114,11 @@ DHT dht(PIN_DHT, DHT_TYPE);
 */
 VL53L0X lox;
 
+/*
+ * 128 x 64 OLED
+*/
+SSD1306Wire display(0x3c, PIN_SDA, PIN_SCL);
+
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 
 void IRAM_ATTR loxInterruptHandler()
@@ -132,10 +151,7 @@ int smoothDoorPosition() { // average every 3 readings
 
   uint16_t value =  lox.readRangeContinuousMillimeters(); // read data value
   if (!lox.timeoutOccurred()) {
-    if (index < 3) {
-      values[index++] = value;
-      return 0;
-    } else if (index > 2) { // third new value
+    if (index > 2) { // third new value
       if (values[3] != 0) {
         giLastLOXValue = (uint16_t)(((uint32_t)(values[0] + values[1] + values[2] + values[3])) / 4);
       } else {
@@ -145,6 +161,9 @@ int smoothDoorPosition() { // average every 3 readings
       values[3] = giLastLOXValue;
       values[index++] = value;
       return giLastLOXValue;
+    } else {
+      values[index++] = value;
+      return 0;
     }
   }
   return 0; // no value
@@ -155,8 +174,7 @@ void handleLOX() {
     giLOX = smoothDoorPosition();
     if (0 != giLOX) {
       Homie.getLogger() << "VL53L0X Reading: " << giLOX << endl;
-      snprintf(gBuffer, sizeof(gBuffer), "%d", giLOX);
-      garageNode.setProperty(PROP_POS).send(gBuffer);
+      garageNode.setProperty(PROP_POS).send(String(giLOX));
     }
     gbLOXReady = false;
   }   
@@ -259,7 +277,7 @@ void setupHandler() {
    dht.begin();
    yield();
    
-   Wire.begin(PIN_SDA, PIN_SCL, 400000);
+   Wire.begin(PIN_SDA, PIN_SCL, 100000);
    yield();
 
    delay(2000);
@@ -269,6 +287,7 @@ void setupHandler() {
   if (!gbValue)
   {
     Serial.println("Failed to detect and initialize sensor!");
+    delay(2000);
     ESP.restart();
   }
 
@@ -284,6 +303,22 @@ void setupHandler() {
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
   lox.startContinuous(50); // total should be around 250ms per reading
+
+   // Initialising the UI will init the display too.
+  display.init();
+  display.flipScreenVertically();
+  display.clear();
+
+  // Font Demo1
+  // create more fonts at http://oleddisplay.squix.ch/
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 0, "Hello world");
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(0, 10, "Hello world");
+  display.setFont(ArialMT_Plain_24);
+  display.drawString(0, 26, "Hello world");
+  display.display();
 }
 
 void setup() {
@@ -353,9 +388,9 @@ void setup() {
 
   garageNode.advertise(PROP_POS)
             .setName(PROP_POS_TITLE)
-            .setDatatype("float")
+            .setDatatype("integer")
             .setRetained(true)
-            .setFormat("%.1f")
+            .setFormat("%d")
             .setUnit("#");
 
 
