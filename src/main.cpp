@@ -384,55 +384,8 @@ void sensorHandler() {
   }
 }
 
-/*
- * Primary Sensor Task
- * - Runs all elements
-*/
-void sensorTask(void *pvParameters) {
-  Homie.getLogger() << "SensorTask running on core: " << xPortGetCoreID() << endl;
-    gatherPosition(); 
-    gatherTemps();
-    // gatherEntry();
-
-  while (1) {
-    sensorHandler();
-    vTaskDelay(1);
-    taskYIELD();
-  }
-}
-
-void homieLoopHandler() {
-  if (gbCoreCycle) {
-    if (gvDuration) {
-      displaySensors();
-    }
-    return;
-  }
-
-  gbCoreCycle = true; // make this a oneShot
-
-  /* 
-   * Start ESP32 Sensor Task in Core 0
-  */
-  xTaskCreatePinnedToCore(
-			sensorTask,                     /* Function to implement the task */
-			"Sensors ",                     /* Name of the task */
-			8192,                           /* Stack size in words */
-			NULL,                           /* Task input parameter */
-			5,                              /* Priority of the task */
-			&sensorTaskHandle,              /* Task handle. */
-			1);                             /* Core where the task should run tskNO_AFFINITY */
-
-  if (sensorTaskHandle == NULL) {
-    Serial.println("Failed to start Sensor task!");
-    gbCoreCycle = false;
-    delay(2000);
-    ESP.restart();
-  }
-
-}
-
 void homieSetupHandler() {
+  Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
   yield();
 
@@ -479,6 +432,56 @@ void homieSetupHandler() {
   
 }
 
+/*
+ * Primary Sensor Task
+ * - Runs all elements
+*/
+void sensorTask(void *pvParameters) {
+  Homie.getLogger() << "SensorTask running on core: " << xPortGetCoreID() << endl;
+  
+  // homieSetupHandler();
+  gatherPosition(); 
+  gatherTemps();
+  gatherEntry();
+
+  while (1) {
+    sensorHandler();
+    vTaskDelay(1);
+    taskYIELD();
+  }
+}
+
+void homieLoopHandler() {
+  if (gbCoreCycle) {
+    if (gvDuration) {
+      displaySensors();
+    }
+    return;
+  }
+
+  gbCoreCycle = true; // make this a oneShot
+
+  /* 
+   * Start ESP32 Sensor Task in Core 0
+  */
+  xTaskCreatePinnedToCore(
+			sensorTask,                     /* Function to implement the task */
+			"Sensors ",                     /* Name of the task */
+			8192,                           /* Stack size in words */
+			NULL,                           /* Task input parameter */
+			5,                              /* Priority of the task */
+			&sensorTaskHandle,              /* Task handle. */
+			tskNO_AFFINITY);                             /* Core where the task should run tskNO_AFFINITY */
+
+  if (sensorTaskHandle == NULL) {
+    Serial.println("Failed to start Sensor task!");
+    gbCoreCycle = false;
+    delay(2000);
+    ESP.restart();
+  }
+
+}
+
 void setup() {
   delay(50);
   Serial.begin(115200);
@@ -514,10 +517,11 @@ void setup() {
   Homie_setFirmware(SKN_MOD_NAME, SKN_MOD_VERSION);
   Homie_setBrand(SKN_MOD_BRAND);
   
-  Homie.setSetupFunction(homieSetupHandler)
+  Homie
       .setLoopFunction(homieLoopHandler)
       .setBroadcastHandler(broadcastHandler)
-      .onEvent(onHomieEvent);  
+      .onEvent(onHomieEvent)  
+      .setSetupFunction(homieSetupHandler);
   
   garageNode.advertise(PROP_RELAY)
             .setName(PROP_RELAY_TITLE)
