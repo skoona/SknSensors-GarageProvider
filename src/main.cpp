@@ -9,11 +9,11 @@
  *  - Temperature, Humidity, Motion, EntryCount, and Door Position.
  *  When humans are detected send notice once per stats interval, interval will reset
  *  When analog change from saftey beam, record entry/exit.
- *  When door operates broadcast door position change by 4% for 30 seconds until movement stops
+ *  When door operates broadcast door position change every 1/2 second for 30 seconds
  *  - maybe decode moving up or down, and open/closed from home/max
  *  On handler command pulse Relay to open/close door opener, and reset position timer
- *  Position uses an interrupt to read data, disable VL53L0X when not in used by ignoring it, as shutdown resets device
- *  - also attach/detach interrupt with WiFi enablement and/or non-use
+ *  Position uses an interrupt to read data, disabling VL53L0X when not in use corrupts the I2c channel!
+ *  - also attach/detach interrupt with WiFi enablement/disablement
  * 
  * *   PIN Description  Supply  Trigger
  * =============================================================================
@@ -23,7 +23,8 @@
  * *    16 DHT-11         5V    Data/OneWire  Temperature/Humidity
  * *    36 Volt/Divider 21.5V   ADC           Sensor 100K/16 (100K/15.942=24/3.3)
  * * 22/21 VL53L0X        5V    I2c           Line of Sight Ranger
- * -    18 Data-Ready Interrupt               INTR-FALLING 
+ * -    18 Data-Ready Interrupt GPIO          INTR-FALLING 
+ * -    23 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L0X
  * * 22/21 OLED 128x64    5V    I2c SSD1306   Display
  * =============================================================================
  * 
@@ -32,10 +33,10 @@
     Updating ArduinoJson                     @ 6.14.1         [Up-to-date]
     Updating AsyncMqttClient                 @ 0.8.2          [Up-to-date]
     Updating AsyncTCP                        @ 1.1.1          [Up-to-date]
-    Updating Bounce2                         @ 2.52           [Up-to-date]
+    Updating Bounce2                         @ 2.53           [Up-to-date]
     Updating DHT sensor library for ESPx     @ 1.17           [Up-to-date]
     Updating ESP Async WebServer             @ 1.2.3          [Up-to-date]
-    Updating ESP8266 and ESP32 OLED driver for SSD1306 displays @ 4.1.0  [Up-to-date]
+    Updating ESP8266 and ESP32 OLED driver for SSD1306 displays @ 4.1.0   [Up-to-date]
     Updating ESPAsyncTCP                     @ 1.2.2          [Up-to-date]
     Updating Homie                           @ 3.0.0          [Up-to-date]
     Updating VL53L0X                         @ 1.2.0          [Up-to-date]
@@ -57,7 +58,7 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.3.0"
+#define SKN_MOD_VERSION "0.4.0"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Door Operations"
 
@@ -106,13 +107,13 @@ volatile int      giEntry            = 0,
                   giEntryCount       = 0,
                   giLastEntry        = 10;        
 
-volatile bool     gbLOXReady         = false,
+volatile bool     gbLOXReady         = true,       // VL53L0X startup 
+                  gbLOXRunMode       = true,       // VL53L0X startup 
                   gbDisplayOn        = true,
                   gvDuration         = false,
                   gbValue            = false,
                   gvMotion           = false,  
-                  gvLastMotion       = false,
-                  gbCoreCycle        = false; // trigger to use core0
+                  gvLastMotion       = false;
 
 volatile  uint16_t giLOX             = 0,
                   giValue            = 0,
@@ -138,12 +139,6 @@ String            pchmotionON  = F("Motion: ON "),
 
 
 /*
- * ESP32 Tasks for Core 0
-*/
-void sensorTask(void *pvParameters);
-TaskHandle_t sensorTaskHandle = NULL;
-
-/*
  * Temperature Sensor
 */	
 DHTesp dht;
@@ -164,8 +159,8 @@ VL53L0X lox;
 /*
  * ExponentialFilter for Distance Value and ADC Readings
 */
-ExponentialFilter<uint16_t> FilteredPosition(55, 1000);
-ExponentialFilter<uint32_t> FilteredEntry(55, 1000);
+ExponentialFilter<uint16_t> FilteredPosition(20, 2000);
+ExponentialFilter<uint32_t> FilteredEntry(20, 2000);
 
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 
@@ -202,7 +197,9 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == pchON || value == "true" || value == "on") {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
-    gulLoxDuration   = setDuration( 30000UL ); // LOX read for 30 seconds
+    gulLoxDuration   = setDuration( 30000UL ); // LOX read for 30 seconds   
+    gbLOXReady       = true;
+    gbLOXRunMode     = true;
 
     digitalWrite(PIN_RELAY, HIGH );
     delay(500);
@@ -218,30 +215,38 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
  * - Time controlled by caller and/or Door Operator
  */
 void gatherPosition() {
-  taskYIELD();
+  if ( gbLOXReady && (guiTimeBase >= gulLoxDuration)) {
+    if (gbLOXRunMode) {
+      gbLOXRunMode = false;
+    }
+    gbLOXReady = false;
+    Homie.getLogger() << F("VL53L0X OFF~> Read: ") << giLastLOXValue 
+                      << ", Raw: " << giLOX 
+                      << endl;      
+    taskYIELD();
+    return;
+  } 
+
   if (gbLOXReady) {
     giLOX = lox.readRangeContinuousMillimeters(); // read data value
-    if (!lox.timeoutOccurred()) {
+    if (!lox.timeoutOccurred() && giLOX > 1) {
       FilteredPosition.Filter(giLOX);
       giLastLOXValue = FilteredPosition.Current();
-      garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
-
-      Homie.getLogger() << F("VL53L0X Read: ") << giLOX  << endl;
+      gbLOXReady = false;
+      
+      if (gvDuration) {
+        garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+      }
+      Homie.getLogger() << F("VL53L0X Read: ") << giLastLOXValue 
+                        << ", Raw: " << giLOX 
+                        << endl;      
       
     } else {
       Homie.getLogger() << F("VL53L0X Timeout: ") << lox.last_status  << endl;
     }
-    gbLOXReady = false;
   }   
+  
   taskYIELD();
-
-  if (gulLoxDuration > guiTimeBase) {
-    lox.stopContinuous();
-    gbLOXReady = false;
-  } else {
-    gbLOXReady = false;
-    lox.startContinuous(50);
-  }
 }
 
 /**
@@ -284,7 +289,7 @@ void gatherMotion(bool stats = false ) {
     gvLastMotion = gvMotion;
   }
 
-  if (stats && gvMotion) {
+  if (stats) {
     gvLastMotion = gvMotion = false;
     garageNode.setProperty(PROP_MOTION).send(pchOFF);
     Homie.getLogger() << pchmotionOFF << endl;
@@ -381,10 +386,12 @@ void onHomieEvent(const HomieEvent& event) {
   }
 }
 
+
 /*
- * Core 0 Sensor Task
- */
-void sensorHandler() {
+ * Primary Sensor Task
+ * - Runs all elements
+*/
+void homieLoopHandler() {
   guiTimeBase = millis();
   gvDuration = ((guiTimeBase - gulLastTimeBase) >= 500);
 
@@ -398,15 +405,14 @@ void sensorHandler() {
     gatherMotion(true);  // turn off
   }
 
-  if (gvDuration && gbLOXReady && gulLoxDuration >= guiTimeBase) { // Interrupt Driven Handler
-    gatherPosition(); 
-  }
+  gatherPosition(); // Interrupt Driven Handler
 
   if (guiTimeBase >= gulTempsDuration ) {    
     gatherTemps();
   }
 
   if (gvDuration) { // Every half second poll 
+    displaySensors();
     gulLastTimeBase = guiTimeBase;
   }
 }
@@ -414,22 +420,26 @@ void sensorHandler() {
 void homieSetupHandler() {
   Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
 
-   // Initialising the display.
+  Wire.begin(PIN_SDA, PIN_SCL, 400000);
+  delay(50);
+
+  dht.setup(PIN_DHT, DHTesp::DHT11);
+  delay(50);
+
+  /*
+   * Initialising the display.
+   * create fonts at http://oleddisplay.squix.ch/
+  */ 
   display.init();
   display.flipScreenVertically();
   display.clear();
-  yield();
-
-  // Font Demo1
-  // create more fonts at http://oleddisplay.squix.ch/
   display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.setFont(ArialMT_Plain_16);
-
   display.drawString(0, 0, SKN_MOD_TITLE);
   display.drawString(40, 16, SKN_MOD_VERSION);
   display.drawString(0, 32, "0123456789ABC");
   display.display();
-  yield();
+  delay(50);
 
   /*
    * lower the return signal rate limit (default is 0.25 MCPS)
@@ -442,71 +452,27 @@ void homieSetupHandler() {
   gbValue = lox.init();
   lox.setTimeout(500);
   if (!gbValue) { 
+    Serial.println("Failed to detect and initialize VL53L0X sensor! (1)");
+      digitalWrite(PIN_SHDN, LOW); 
       taskYIELD();
       delay(1000);
+      digitalWrite(PIN_SHDN, HIGH); 
+      taskYIELD();
     gbValue = lox.init(); // try again
   }
   if (!gbValue) {
-    Serial.println("Failed to detect and initialize VL53L0X sensor!");
+    Serial.println("Failed to detect and initialize VL53L0X sensor! (2)");
     display.drawString(0, 48, "VL53L0X Failed!");
     display.display();
     delay(2000);
     ESP.restart();
   }
+  delay(50);
   lox.setSignalRateLimit(0.1);
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
-  lox.startContinuous(50); // total should be around 250ms per reading
-    taskYIELD();
-  
-}
-
-/*
- * Primary Sensor Task
- * - Runs all elements
-*/
-void sensorTask(void *pvParameters) {
-  Homie.getLogger() << "SensorTask running on core: " << xPortGetCoreID() << endl;  
-  gatherPosition(); 
-  gatherTemps();
-  gatherEntry();
-
-  while (1) {
-    sensorHandler();
-    taskYIELD();
-  }
-}
-
-void homieLoopHandler() {
-  if (gbCoreCycle) {
-    if (gvDuration) {
-      displaySensors();
-    }
-    return;
-  }
-
-  gbCoreCycle = true; // make this a oneShot
-
-  /* 
-   * Start ESP32 Sensor Task in Core 0
-  */
-  xTaskCreatePinnedToCore(
-			sensorTask,                     /* Function to implement the task */
-			"Sensors ",                     /* Name of the task */
-			8192,                           /* Stack size in words */
-			NULL,                           /* Task input parameter */
-			5,                              /* Priority of the task */
-			&sensorTaskHandle,              /* Task handle. */
-			1);                             /* Core where the task should run tskNO_AFFINITY */
-
-  if (sensorTaskHandle == NULL) {
-    Serial.println("Failed to start Sensor task!");
-    gbCoreCycle = false;
-    delay(2000);
-    ESP.restart();
-  }
-
+  lox.startContinuous(500); // total should be around 250ms per reading
 }
 
 void setup() {
@@ -526,16 +492,10 @@ void setup() {
   digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 
   /* Turn off Distance and Entry Readings */
-  gulTempsDuration = gulEntryDuration = gulLoxDuration = setDuration( 1000UL );
+  gulTempsDuration = gulEntryDuration = gulLoxDuration = millis(); // setDuration( 1000UL );
 
-  FilteredPosition.Filter(8000);
-  FilteredEntry.Filter(1000);
-
-  delay(50);
-  Wire.begin(PIN_SDA, PIN_SCL, 400000);
-
-  dht.setup(PIN_DHT, DHTesp::DHT11);
-  yield();
+  FilteredPosition.Filter(2000);
+  FilteredEntry.Filter(2000);
 
   /*
    * Voltage divider analog in pins
