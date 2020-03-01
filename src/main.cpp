@@ -21,10 +21,10 @@
  * -    17 Motion-Detected Interrupt          INTR-RISING
  * *    19 RELAY        3.3V    HIGH
  * *    16 DHT-11         5V    Data/OneWire  Temperature/Humidity
- * *    36 Volt/Divider 21.5V   ADC           Sensor
- * * 22/21 VL53L0X      3.3V    I2c           Line of Sight Ranger
+ * *    36 Volt/Divider 21.5V   ADC           Sensor 100K/16 (100K/15.942=24/3.3)
+ * * 22/21 VL53L0X        5V    I2c           Line of Sight Ranger
  * -    18 Data-Ready Interrupt               INTR-FALLING 
- * * 22/21 OLED 128x64  3.3V    I2c SSD1306   Display
+ * * 22/21 OLED 128x64    5V    I2c SSD1306   Display
  * =============================================================================
  * 
  * 
@@ -57,7 +57,7 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.2.1"
+#define SKN_MOD_VERSION "0.3.0"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Door Operations"
 
@@ -79,6 +79,7 @@
 #define PIN_DHT           16
 #define PIN_MOTION        17
 #define PIN_L0X           18
+#define PIN_SHDN          23
 #define PIN_RELAY         19
 #define PIN_SDA           21
 #define PIN_SCL           22
@@ -106,6 +107,7 @@ volatile int      giEntry            = 0,
                   giLastEntry        = 10;        
 
 volatile bool     gbLOXReady         = false,
+                  gbDisplayOn        = true,
                   gvDuration         = false,
                   gbValue            = false,
                   gvMotion           = false,  
@@ -121,8 +123,9 @@ volatile float    gfTemperature      = 0.0f,
                   gfValue            = 0.0f,
                    value             = 0.0f;
 
-char              gBuffer[48],
+char              gcTemp[48],
                   gcTemps[48],
+                  gcHumid[48],
                   gcPosition[48],
                   gcEntry[48];
 
@@ -161,7 +164,7 @@ VL53L0X lox;
 /*
  * ExponentialFilter for Distance Value and ADC Readings
 */
-ExponentialFilter<uint16_t> FilteredPosition(55, 8000);
+ExponentialFilter<uint16_t> FilteredPosition(55, 1000);
 ExponentialFilter<uint32_t> FilteredEntry(55, 1000);
 
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
@@ -169,7 +172,7 @@ HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 /**
  * Utility to handle Duration Roll Overs
 */
-unsigned long setDuration(unsigned long duration) {
+unsigned long IRAM_ATTR setDuration(unsigned long duration) {
   unsigned long value = millis() + duration;
   if (value <= duration) { // rolled
     value = duration;
@@ -178,9 +181,9 @@ unsigned long setDuration(unsigned long duration) {
 }
 
 void IRAM_ATTR motionInterruptHandler() {
+  gulMotionDuration = setDuration( 600000UL ); // Wait 10 min for an entry
   gvMotion = true;
   gvLastMotion = false;
-  gulMotionDuration = setDuration( 600000UL ); // Wait 10 min for an entry
 }
 
 void IRAM_ATTR loxInterruptHandler() {
@@ -198,10 +201,8 @@ bool broadcastHandler(const String& level, const String& value) {
 bool doorOperatorHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == pchON || value == "true" || value == "on") {
-    // handle rollover
-    gulLoxDuration   = setDuration( 30000UL ); // LOX read for 30 seconds
-    gbLOXReady = true;
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
+    gulLoxDuration   = setDuration( 30000UL ); // LOX read for 30 seconds
 
     digitalWrite(PIN_RELAY, HIGH );
     delay(500);
@@ -217,6 +218,7 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
  * - Time controlled by caller and/or Door Operator
  */
 void gatherPosition() {
+  taskYIELD();
   if (gbLOXReady) {
     giLOX = lox.readRangeContinuousMillimeters(); // read data value
     if (!lox.timeoutOccurred()) {
@@ -224,11 +226,22 @@ void gatherPosition() {
       giLastLOXValue = FilteredPosition.Current();
       garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
 
+      Homie.getLogger() << F("VL53L0X Read: ") << giLOX  << endl;
+      
     } else {
       Homie.getLogger() << F("VL53L0X Timeout: ") << lox.last_status  << endl;
     }
     gbLOXReady = false;
   }   
+  taskYIELD();
+
+  if (gulLoxDuration > guiTimeBase) {
+    lox.stopContinuous();
+    gbLOXReady = false;
+  } else {
+    gbLOXReady = false;
+    lox.startContinuous(50);
+  }
 }
 
 /**
@@ -261,8 +274,8 @@ void gatherEntry( ) {
 
 /**
  * Interrupt Driven turns on gvMotion
- * - ON with Interrupt
- * - OFF with Stats interval
+ * - ON with Interrupt, duration set by interrupt
+ * - OFF with after duration ends
 */
 void gatherMotion(bool stats = false ) { 
   if (gvLastMotion != gvMotion) {
@@ -278,27 +291,37 @@ void gatherMotion(bool stats = false ) {
   }
 }
 
-// ref: https://github.com/beegee-tokyo/DHTesp
+/**
+ *  ref: https://github.com/beegee-tokyo/DHTesp
+ * Every 10 minutes
+*/
 void gatherTemps() {   // called every status interval 
   newValues = dht.getTempAndHumidity();
   if( (dht.getStatus() == 0) ){    
     gfTemperature = dht.toFahrenheit(newValues.temperature); 
     gfHumidity = newValues.humidity;
 
-    snprintf(gBuffer, sizeof(gBuffer), "%.1f", gfTemperature);
-    garageNode.setProperty(PROP_TEMP).send(gBuffer);
+    snprintf(gcTemps, sizeof(gcTemps), "%.1f", gfTemperature);
+    garageNode.setProperty(PROP_TEMP).send(gcTemps);
   
-    snprintf(gBuffer, sizeof(gBuffer), "%.1f", gfHumidity);
-    garageNode.setProperty(PROP_HUM).send(gBuffer);      
+    snprintf(gcHumid, sizeof(gcHumid), "%.1f", gfHumidity);
+    garageNode.setProperty(PROP_HUM).send(gcHumid);      
   }     
+  gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
 }
 
 /**
  * Update Local OLED Display
+ * - Only while Motion is Active
 */
 void displaySensors() {
-  if (gbCoreCycle) {
+  if (gvMotion) {
  
+    if (!gbDisplayOn) {
+      display.displayOn();
+      gbDisplayOn = true;
+    } 
+
     snprintf(gcEntry, sizeof(gcEntry), "C:%d M:%d", giEntryCount, giEntryMax );
     snprintf(gcTemps, sizeof(gcTemps), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
     snprintf(gcPosition, sizeof(gcPosition), "P:%hd R:%hd", giLastLOXValue, giLOX );
@@ -309,17 +332,22 @@ void displaySensors() {
       display.drawString(0,32, (gvMotion ? pchmotionON : pchmotionOFF));
       display.drawString(0,48, gcEntry);
     display.display();
+
+  } else {
+    if (gbDisplayOn) {
+      gbDisplayOn = false;
+      display.displayOff();
+    }
   }
 }
 
 /**
- * Send Current sensor data to monitor
+ * Send Current sensor data to monitors
+ * - Only during stats cycle
 */
 void sendSensorStats() {
-  snprintf(gBuffer, sizeof(gBuffer), "%.1f", gfTemperature);
-  garageNode.setProperty(PROP_TEMP).send(gBuffer);
-  snprintf(gBuffer, sizeof(gBuffer), "%.1f", gfHumidity);
-  garageNode.setProperty(PROP_HUM).send(gBuffer); 
+  garageNode.setProperty(PROP_TEMP).send(gcTemp);
+  garageNode.setProperty(PROP_HUM).send(gcHumid); 
   
   garageNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF)); 
   garageNode.setProperty(PROP_ENTRY).send(String(giEntryCount));  
@@ -374,9 +402,8 @@ void sensorHandler() {
     gatherPosition(); 
   }
 
-  if (gulTempsDuration >= guiTimeBase ) {    
+  if (guiTimeBase >= gulTempsDuration ) {    
     gatherTemps();
-    gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
   }
 
   if (gvDuration) { // Every half second poll 
@@ -386,11 +413,6 @@ void sensorHandler() {
 
 void homieSetupHandler() {
   Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
-  Wire.begin(PIN_SDA, PIN_SCL, 400000);
-  yield();
-
-  dht.setup(PIN_DHT, DHTesp::DHT11);
-  yield();
 
    // Initialising the display.
   display.init();
@@ -416,10 +438,18 @@ void homieSetupHandler() {
    * Use continuous timed mode and provide the desired 
    * inter-measurement period in ms (e.g. sensor.startContinuous(250)).
   */
-  lox.setTimeout(200);
+  lox.setTimeout(500);
   gbValue = lox.init();
+  lox.setTimeout(500);
+  if (!gbValue) { 
+      taskYIELD();
+      delay(1000);
+    gbValue = lox.init(); // try again
+  }
   if (!gbValue) {
     Serial.println("Failed to detect and initialize VL53L0X sensor!");
+    display.drawString(0, 48, "VL53L0X Failed!");
+    display.display();
     delay(2000);
     ESP.restart();
   }
@@ -428,7 +458,7 @@ void homieSetupHandler() {
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
   lox.startContinuous(50); // total should be around 250ms per reading
-  yield();
+    taskYIELD();
   
 }
 
@@ -437,16 +467,13 @@ void homieSetupHandler() {
  * - Runs all elements
 */
 void sensorTask(void *pvParameters) {
-  Homie.getLogger() << "SensorTask running on core: " << xPortGetCoreID() << endl;
-  
-  // homieSetupHandler();
+  Homie.getLogger() << "SensorTask running on core: " << xPortGetCoreID() << endl;  
   gatherPosition(); 
   gatherTemps();
   gatherEntry();
 
   while (1) {
     sensorHandler();
-    vTaskDelay(1);
     taskYIELD();
   }
 }
@@ -471,7 +498,7 @@ void homieLoopHandler() {
 			NULL,                           /* Task input parameter */
 			5,                              /* Priority of the task */
 			&sensorTaskHandle,              /* Task handle. */
-			tskNO_AFFINITY);                             /* Core where the task should run tskNO_AFFINITY */
+			1);                             /* Core where the task should run tskNO_AFFINITY */
 
   if (sensorTaskHandle == NULL) {
     Serial.println("Failed to start Sensor task!");
@@ -494,13 +521,21 @@ void setup() {
   pinMode(PIN_MOTION, INPUT);     // RCWL sensor
   pinMode(PIN_L0X,    INPUT);     // VL53L0X Interrupt Ready Pin
   pinMode(PIN_RELAY, OUTPUT);     // Door operator
+  pinMode(PIN_SHDN, OUTPUT);      // VL53L0X Shutdown/Enable
   digitalWrite(PIN_RELAY, LOW);   // Init door to off
+  digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 
   /* Turn off Distance and Entry Readings */
   gulTempsDuration = gulEntryDuration = gulLoxDuration = setDuration( 1000UL );
 
   FilteredPosition.Filter(8000);
   FilteredEntry.Filter(1000);
+
+  delay(50);
+  Wire.begin(PIN_SDA, PIN_SCL, 400000);
+
+  dht.setup(PIN_DHT, DHTesp::DHT11);
+  yield();
 
   /*
    * Voltage divider analog in pins
