@@ -58,7 +58,7 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.4.0"
+#define SKN_MOD_VERSION "0.4.2"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Door Operations"
 
@@ -94,45 +94,42 @@
 /*
  * Sensor Values
  */
-volatile unsigned long guiTimeBase   = 0,
-                  gulLastTimeBase    = 0,
-                  gulTempsDuration   = 0,
-                  gulMotionDuration  = 0,
-                  gulLoxDuration     = 0,
-                  gulEntryDuration   = 0;
+volatile unsigned long guiTimeBase   = 0,     // default time base, target 0.5 seconds
+                  gulLastTimeBase    = 0,     // time base delta
+                  gulTempsDuration   = 0,     // time between each temp measurement
+                  gulMotionDuration  = 0,     // time to hold motion after trigger interrupt
+                  gulLoxDuration     = 0,     // time to run VL53L0X after door operates
+                  gulEntryDuration   = 0;     // time to run beam break monitor after door operates
 
-volatile int      giEntry            = 0,
-                  giEntryMax         = 600,
-                  giEntryMin         = 600,
-                  giEntryCount       = 0,
-                  giLastEntry        = 10;        
+volatile int      giEntry            = 0,     // value of beam break ADC
+                  giEntryMax         = 600,   // open value of ADC reading -- break
+                  giEntryMin         = 600,   // close value of ADC reading -- no break
+                  giEntryCount       = 0,     // count of number of entries since startup
+                  giLastEntry        = 10;    // ADC reading of last entry    
 
-volatile bool     gbLOXReady         = true,       // VL53L0X startup 
-                  gbLOXRunMode       = true,       // VL53L0X startup 
-                  gbDisplayOn        = true,
-                  gvDuration         = false,
-                  gbValue            = false,
-                  gvMotion           = false,  
-                  gvLastMotion       = false;
+volatile bool     gbLOXReady         = true,  // VL53L0X startup -- Interrupt
+                  gbLOXRunMode       = true,  // VL53L0X startup 
+                  gbDisplayOn        = true,  // Display SHOULD be on or off    
+                  gvDuration         = false, // 1/2 second marker
+                  gbValue            = false, // initialization boolean, general use
+                  gvMotion           = false, // Motion indicator value -- Interrupt
+                  gvLastMotion       = false; // Previous Motion indicator
 
-volatile  uint16_t giLOX             = 0,
-                  giValue            = 0,
-                  giLastLOXValue     = 0;
+volatile  uint16_t giLOX             = 0,     // VL53L0X current reading
+                  giLastLOXValue     = 0;     // VL53L0X Previous reading
 
-volatile float    gfTemperature      = 0.0f, 
-                  gfHumidity         = 0.0f,
-                  gfValue            = 0.0f,
-                   value             = 0.0f;
+volatile float    gfTemperature      = 0.0f,  // Current Temperature value
+                  gfHumidity         = 0.0f;  // Current Humidity value
 
-char              gcTemp[48],
-                  gcTemps[48],
-                  gcHumid[48],
-                  gcPosition[48],
-                  gcEntry[48];
+char              gcTemp[48],                 // Current Temperature Formatted
+                  gcTemps[48],                // Combined Temperature and Humidity Formatted
+                  gcHumid[48],                // Current Humidity Formatted
+                  gcPosition[48],             // Current VL53L0X Positon Formatted
+                  gcEntry[48];                // Current ADC Entry value
 
 
 
-String            pchmotionON  = F("Motion: ON "),
+String            pchmotionON  = F("Motion: ON "), // String constants for logging
                   pchmotionOFF = F("Motion: OFF"),
                   pchOFF       = F("OFF"),
                   pchON        = F("ON");
@@ -197,9 +194,11 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == pchON || value == "true" || value == "on") {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
-    gulLoxDuration   = setDuration( 30000UL ); // LOX read for 30 seconds   
+    gulLoxDuration   = setDuration( 60000UL ); // LOX read for 60 seconds   
     gbLOXReady       = true;
     gbLOXRunMode     = true;
+    digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
+
 
     digitalWrite(PIN_RELAY, HIGH );
     delay(500);
@@ -217,6 +216,7 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
 void gatherPosition() {
   if ( gbLOXReady && (guiTimeBase >= gulLoxDuration)) {
     if (gbLOXRunMode) {
+      digitalWrite(PIN_SHDN, LOW);   // H to enable, L to disable -- might also reset
       gbLOXRunMode = false;
     }
     gbLOXReady = false;
@@ -234,9 +234,8 @@ void gatherPosition() {
       giLastLOXValue = FilteredPosition.Current();
       gbLOXReady = false;
       
-      if (gvDuration) {
-        garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
-      }
+      garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+
       Homie.getLogger() << F("VL53L0X Read: ") << giLastLOXValue 
                         << ", Raw: " << giLOX 
                         << endl;      
@@ -473,6 +472,9 @@ void homieSetupHandler() {
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
   lox.startContinuous(500); // total should be around 250ms per reading
+
+  delay(50);
+  digitalWrite(PIN_SHDN, LOW);   // H to enable, L to disable -- might also reset
 }
 
 void setup() {
