@@ -50,7 +50,6 @@
 #include <VL53L0X.h>
 
 #include "DHTesp.h"
-#include "ExponentialFilter.h"
 
 #ifndef ESP32
 #pragma message(THIS MODULE IS FOR ESP32 ONLY!)
@@ -58,14 +57,14 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.4.2"
+#define SKN_MOD_VERSION "0.4.3"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Door Operations"
 
 #define NODE_NAME       "Door Control"
 
 #define PROP_ENTRY        "entry"
-#define PROP_ENTRY_TITLE  "Entry Cnt"
+#define PROP_ENTRY_TITLE  "Entries"
 #define PROP_RELAY        "operator"
 #define PROP_RELAY_TITLE  "Operator"
 #define PROP_MOTION       "motion"
@@ -141,7 +140,6 @@ String            pchmotionON  = F("Motion: ON "), // String constants for loggi
 DHTesp dht;
 TempAndHumidity newValues;
 
-
 /*
  * 128 x 64 OLED 
  * - This should be first, since it initializes Wire
@@ -152,12 +150,6 @@ SSD1306Wire display(0x3c, PIN_SDA, PIN_SCL, GEOMETRY_128_64);
  * Time of Flight Sensor
 */
 VL53L0X lox;
-
-/*
- * ExponentialFilter for Distance Value and ADC Readings
-*/
-ExponentialFilter<uint16_t> FilteredPosition(20, 2000);
-ExponentialFilter<uint32_t> FilteredEntry(20, 2000);
 
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 
@@ -187,6 +179,7 @@ bool broadcastHandler(const String& level, const String& value) {
   return true;
 }
 
+
 /**
  * When door is operated release the Entry counter and the Distance Ranger
 */
@@ -198,7 +191,13 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
     gbLOXReady       = true;
     gbLOXRunMode     = true;
     digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
-
+      delay(100);
+      lox.setSignalRateLimit(0.1);
+      lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
+      lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
+      lox.setMeasurementTimingBudget(200000);
+      lox.startContinuous(500); // total should be around 250ms per reading
+    taskYIELD();
 
     digitalWrite(PIN_RELAY, HIGH );
     delay(500);
@@ -229,9 +228,8 @@ void gatherPosition() {
 
   if (gbLOXReady) {
     giLOX = lox.readRangeContinuousMillimeters(); // read data value
-    if (!lox.timeoutOccurred() && giLOX > 1) {
-      FilteredPosition.Filter(giLOX);
-      giLastLOXValue = FilteredPosition.Current();
+    if (!lox.timeoutOccurred() && giLOX > 1 && giLOX < 8100) {
+      giLastLOXValue = giLOX;
       gbLOXReady = false;
       
       garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
@@ -241,7 +239,7 @@ void gatherPosition() {
                         << endl;      
       
     } else {
-      Homie.getLogger() << F("VL53L0X Timeout: ") << lox.last_status  << endl;
+      Homie.getLogger() << F("VL53L0X Timeout or Out of Range: ") << lox.last_status  << endl;
     }
   }   
   
@@ -258,13 +256,13 @@ void gatherEntry( ) {
   /*
     * 4.9vdc produces a reading of 1058 ish 
     * should run inside doorPosition min/max limits   */    
-  FilteredEntry.Filter( adc1_get_raw(ADC1_CHANNEL_0) );
-  giEntry = FilteredEntry.Current();
+  giEntry = adc1_get_raw(ADC1_CHANNEL_0);
   if ( giEntry != giLastEntry ) { // 20 to 21.5 volts, 
     if (giEntry > giEntryMax) {
       giEntryCount++;  
       garageNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
       Homie.getLogger() << "Entries: " << giEntryCount 
+                        << ", Volts: " << (float)(((giEntry - 170) / 4096.0) * 25)
                         << ", Raw: " << giEntry 
                         << ", Min: " << giEntryMin
                         << ", Max: " << giEntryMax << endl;
@@ -325,8 +323,8 @@ void displaySensors() {
       display.displayOn();
       gbDisplayOn = true;
     } 
-
-    snprintf(gcEntry, sizeof(gcEntry), "C:%d M:%d", giEntryCount, giEntryMax );
+    
+    snprintf(gcEntry, sizeof(gcEntry), "C:%d Vdc:%.2f", giEntryCount, (float)(((giEntry - 170) / 4096.0) * 25) );
     snprintf(gcTemps, sizeof(gcTemps), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
     snprintf(gcPosition, sizeof(gcPosition), "P:%hd R:%hd", giLastLOXValue, giLOX );
 
@@ -472,9 +470,6 @@ void homieSetupHandler() {
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
   lox.startContinuous(500); // total should be around 250ms per reading
-
-  delay(50);
-  digitalWrite(PIN_SHDN, LOW);   // H to enable, L to disable -- might also reset
 }
 
 void setup() {
@@ -495,9 +490,6 @@ void setup() {
 
   /* Turn off Distance and Entry Readings */
   gulTempsDuration = gulEntryDuration = gulLoxDuration = millis(); // setDuration( 1000UL );
-
-  FilteredPosition.Filter(2000);
-  FilteredEntry.Filter(2000);
 
   /*
    * Voltage divider analog in pins
