@@ -12,7 +12,7 @@
  *  When door operates broadcast door position change every 1/2 second for 30 seconds
  *  - maybe decode moving up or down, and open/closed from home/max
  *  On handler command pulse Relay to open/close door opener, and reset position timer
- *  Position uses an interrupt to read data, disabling VL53L0X when not in use corrupts the I2c channel!
+ *  Position uses an interrupt to read data, disabling VL53L1X when not in use corrupts the I2c channel!
  *  - also attach/detach interrupt with WiFi enablement/disablement
  * 
  * *   PIN Description  Supply  Trigger
@@ -22,9 +22,9 @@
  * *    D5 RELAY        3.3V    HIGH
  * *    D6 DHT-11         5V    Data/OneWire  Temperature/Humidity
  * *    A0 Volt/Divider 21.5V   ADC           Sensor 100K/16 (120K/12K={21.5=1.955v}{20.0/1.818v})
- * * D1/D2 VL53L0X        3.3V  I2c           Line of Sight Ranger
+ * * D1/D2 VL53L1X        3.3V  I2c           Line of Sight Ranger
  * -    D4 Data-Ready Interrupt GPIO          INTR-FALLING 
- * -    D3 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L0X
+ * -    D3 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L1X
  * * D1/D2 OLED 128x64    3.3V  I2c SSD1306   Display
  * =============================================================================
  * 
@@ -39,7 +39,7 @@
     Updating ESP8266 and ESP32 OLED driver for SSD1306 displays @ 4.1.0   [Up-to-date]
     Updating ESPAsyncTCP                     @ 1.2.2          [Up-to-date]
     Updating Homie                           @ 3.0.0          [Up-to-date]
-    Updating VL53L0X                         @ 1.2.0          [Up-to-date]
+    Updating VL53L1X                         @ 1.2.0          [Up-to-date]
  */
 
 #include <Arduino.h>
@@ -48,7 +48,7 @@
 #include <Homie.h>
 #include <Wire.h>
 #include "SSD1306Wire.h"
-#include <VL53L0X.h>
+#include <VL53L1X.h>
 
 #include "DHTesp.h"
 
@@ -58,7 +58,7 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.5.0"
+#define SKN_MOD_VERSION "0.6.0"
 #define SKN_MOD_BRAND   "SknSensors"
 #define SKN_MOD_TITLE   "Provider"
 
@@ -79,7 +79,7 @@
 
 #define PIN_DHT           19
 #define PIN_MOTION        23
-#define PIN_L0X_INTR      5 // 17
+#define PIN_L0X_INTR      5 // 5 works
 #define PIN_L0X_SHDN      16
 #define PIN_RELAY         18
 #define PIN_SDA           21
@@ -87,7 +87,7 @@
 #define PIN_ENTRY         36
 
 #define DHT_TYPE          DHT11
-#define ENTRY_VOLTAGE_TARGET 5.0
+#define ENTRY_VOLTAGE_BASE 3.3
 
 /*
  * Sensor Values
@@ -96,7 +96,7 @@ volatile unsigned long guiTimeBase   = 0,     // default time base, target 0.5 s
                   gulLastTimeBase    = 0,     // time base delta
                   gulTempsDuration   = 0,     // time between each temp measurement
                   gulMotionDuration  = 0,     // time to hold motion after trigger interrupt
-                  gulLoxDuration     = 0,     // time to run VL53L0X after door operates
+                  gulLoxDuration     = 0,     // time to run VL53L1X after door operates
                   gulEntryDuration   = 0;     // time to run beam break monitor after door operates
 
 volatile int      giEntry            = 0,     // value of beam break ADC
@@ -105,16 +105,16 @@ volatile int      giEntry            = 0,     // value of beam break ADC
                   giEntryCount       = 0,     // count of number of entries since startup
                   giLastEntry        = 10;    // ADC reading of last entry    
 
-volatile bool     gbLOXReady         = true,  // VL53L0X startup -- Interrupt
-                  gbLOXRunMode       = true,  // VL53L0X startup 
+volatile bool     gbLOXReady         = true,  // VL53L1X startup -- Interrupt
+                  gbLOXRunMode       = true,  // VL53L1X startup 
                   gbDisplayOn        = true,  // Display SHOULD be on or off    
                   gvDuration         = false, // 1/2 second marker
                   gbValue            = false, // initialization boolean, general use
                   gvMotion           = false, // Motion indicator value -- Interrupt
                   gvLastMotion       = false; // Previous Motion indicator
 
-volatile  uint16_t giLOX             = 0,     // VL53L0X current reading
-                  giLastLOXValue     = 0;     // VL53L0X Previous reading
+volatile  uint16_t giLOX             = 0,     // VL53L1X current reading
+                  giLastLOXValue     = 0;     // VL53L1X Previous reading
 
 volatile float    gfTemperature      = 0.0f,  // Current Temperature value
                   gfHumidity         = 0.0f;  // Current Humidity value
@@ -122,7 +122,7 @@ volatile float    gfTemperature      = 0.0f,  // Current Temperature value
 char              gcTemp[48],                 // Current Temperature Formatted
                   gcTemps[48],                // Combined Temperature and Humidity Formatted
                   gcHumid[48],                // Current Humidity Formatted
-                  gcPosition[48],             // Current VL53L0X Positon Formatted
+                  gcPosition[48],             // Current VL53L1X Positon Formatted
                   gcEntry[48];                // Current ADC Entry value
 
 String            pchmotionON  = F("Motion: ON "), // String constants for logging
@@ -146,7 +146,7 @@ SSD1306Wire display(0x3c, PIN_SDA, PIN_SCL, GEOMETRY_128_64);
 /*
  * Time of Flight Sensor
 */
-VL53L0X lox;
+VL53L1X lox;
 
 HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
 
@@ -191,9 +191,7 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
     delay(200);
     digitalWrite(PIN_RELAY, HIGH );
     delay(375);
-      lox.setSignalRateLimit(0.1);
-      lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
-      lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
+      lox.setDistanceMode(VL53L1X::Long);
       lox.setMeasurementTimingBudget(200000);
       lox.startContinuous(500); // total should be around 500ms per reading
     delay(375);
@@ -216,7 +214,7 @@ void gatherPosition() {
       gbLOXRunMode = false;
     }
     gbLOXReady = false;
-    Homie.getLogger() << F("VL53L0X OFF~> Read: ") << giLastLOXValue 
+    Homie.getLogger() << F("VL53L1X OFF~> Read: ") << giLastLOXValue 
                       << ", Raw: " << giLOX 
                       << endl;      
     taskYIELD();
@@ -224,19 +222,19 @@ void gatherPosition() {
   } 
 
   if (gbLOXReady) {
-    giLOX = lox.readRangeContinuousMillimeters(); // read data value
+    giLOX = lox.read(); // read data value
     if (!lox.timeoutOccurred() && giLOX > 1 && giLOX < 8100) {
       giLastLOXValue = giLOX;
       gbLOXReady = false;
       
       garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
 
-      Homie.getLogger() << F("VL53L0X Read: ") << giLastLOXValue 
+      Homie.getLogger() << F("VL53L1X Read: ") << giLastLOXValue 
                         << ", Raw: " << giLOX 
                         << endl;      
       
     } else {
-      Homie.getLogger() << F("VL53L0X Timeout or Out of Range: ") << lox.last_status  << endl;
+      Homie.getLogger() << F("VL53L1X Timeout or Out of Range: ") << lox.last_status  << endl;
     }
   }   
   
@@ -251,7 +249,7 @@ void gatherPosition() {
 */
 
 float sknAdcToVolts(int value) {
-  return (float)((value / 4096.0) * ENTRY_VOLTAGE_TARGET) * 10.0;
+  return (float)(((value / 4096.0) * ENTRY_VOLTAGE_BASE) * 10.0) / 0.49;
 }
 
 void gatherEntry( ) {
@@ -454,7 +452,7 @@ void homieSetupHandler() {
   gbValue = lox.init();
   lox.setTimeout(500);
   if (!gbValue) { 
-    Serial.println("Failed to detect and initialize VL53L0X sensor! (1)");
+    Serial.println("Failed to detect and initialize VL53L1X sensor! (1)");
       digitalWrite(PIN_L0X_SHDN, LOW); 
       taskYIELD();
       delay(1000);
@@ -463,18 +461,16 @@ void homieSetupHandler() {
     gbValue = lox.init(); // try again
   }
   if (!gbValue) {
-    Serial.println("Failed to detect and initialize VL53L0X sensor! (2)");
-    display.drawString(0, 48, "VL53L0X Failed!");
+    Serial.println("Failed to detect and initialize VL53L1X sensor! (2)");
+    display.drawString(0, 48, "VL53L1X Failed!");
     display.display();
     delay(2000);
     ESP.restart();
   }
   delay(500);
-  lox.setSignalRateLimit(0.1);
-  lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
-  lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
-  lox.setMeasurementTimingBudget(200000);
-  lox.startContinuous(500); // total should be around 250ms per reading
+    lox.setDistanceMode(VL53L1X::Long);
+    lox.setMeasurementTimingBudget(200000);
+    lox.startContinuous(500); // total should be around 500ms per reading
   delay(500);
 }
 
@@ -488,9 +484,9 @@ void setup() {
 
   pinMode(PIN_ENTRY,  INPUT);     // analog sensor of IR door break 20.0vdc = off, 21.5vdc = on
   pinMode(PIN_MOTION, INPUT);     // RCWL sensor
-  pinMode(PIN_L0X_INTR, INPUT);   // VL53L0X Interrupt Ready Pin
+  pinMode(PIN_L0X_INTR, INPUT);   // VL53L1X Interrupt Ready Pin
   pinMode(PIN_RELAY, OUTPUT);     // Door operator
-  pinMode(PIN_L0X_SHDN, OUTPUT);  // VL53L0X Shutdown/Enable
+  pinMode(PIN_L0X_SHDN, OUTPUT);  // VL53L1X Shutdown/Enable
   digitalWrite(PIN_RELAY, LOW);   // Init door to off
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 

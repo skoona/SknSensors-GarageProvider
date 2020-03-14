@@ -1,6 +1,6 @@
 {
     "name": "Garage Door Opener",
-    "device_id": "GarageControl",
+    "device_id": "GarageProvider",
   "device_stats_interval": 180,  
   "wifi": {
     "ssid": "SFNSS1-24G",
