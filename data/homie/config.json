@@ -1,5 +1,5 @@
 {
-    "name": "Garage Door Opnener",
+    "name": "Garage Door Opener",
     "device_id": "GarageControl",
   "device_stats_interval": 180,  
   "wifi": {

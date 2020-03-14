@@ -17,15 +17,15 @@
  * 
  * *   PIN Description  Supply  Trigger
  * =============================================================================
- * *    17 RCWL-0516      5V    HIGH (3.3V)   if motion detected. 0V normally.
- * -    17 Motion-Detected Interrupt          INTR-RISING
- * *    19 RELAY        3.3V    HIGH
- * *    16 DHT-11         5V    Data/OneWire  Temperature/Humidity
- * *    36 Volt/Divider 21.5V   ADC           Sensor 100K/16 (100K/15.942=24/3.3)
- * * 22/21 VL53L0X        5V    I2c           Line of Sight Ranger
- * -    18 Data-Ready Interrupt GPIO          INTR-FALLING 
- * -    23 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L0X
- * * 22/21 OLED 128x64    5V    I2c SSD1306   Display
+ * *    D7 RCWL-0516      5V    HIGH (3.3V)   if motion detected. 0V normally.
+ * -    D7 Motion-Detected Interrupt          INTR-RISING
+ * *    D5 RELAY        3.3V    HIGH
+ * *    D6 DHT-11         5V    Data/OneWire  Temperature/Humidity
+ * *    A0 Volt/Divider 21.5V   ADC           Sensor 100K/16 (120K/12K={21.5=1.955v}{20.0/1.818v})
+ * * D1/D2 VL53L0X        3.3V  I2c           Line of Sight Ranger
+ * -    D4 Data-Ready Interrupt GPIO          INTR-FALLING 
+ * -    D3 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L0X
+ * * D1/D2 OLED 128x64    3.3V  I2c SSD1306   Display
  * =============================================================================
  * 
  * 
@@ -44,9 +44,10 @@
 
 #include <Arduino.h>
 #include <driver/adc.h>
-#include "SSD1306Wire.h"
 
 #include <Homie.h>
+#include <Wire.h>
+#include "SSD1306Wire.h"
 #include <VL53L0X.h>
 
 #include "DHTesp.h"
@@ -57,9 +58,9 @@
 #endif
 
 #define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.4.3"
+#define SKN_MOD_VERSION "0.5.0"
 #define SKN_MOD_BRAND   "SknSensors"
-#define SKN_MOD_TITLE   "Door Operations"
+#define SKN_MOD_TITLE   "Provider"
 
 #define NODE_NAME       "Door Control"
 
@@ -76,19 +77,17 @@
 #define PROP_POS          "positon"
 #define PROP_POS_TITLE    "Position"
 
-#define PIN_DHT           16
-#define PIN_MOTION        17
-#define PIN_L0X           18
-#define PIN_SHDN          23
-#define PIN_RELAY         19
+#define PIN_DHT           19
+#define PIN_MOTION        23
+#define PIN_L0X_INTR      5 // 17
+#define PIN_L0X_SHDN      16
+#define PIN_RELAY         18
 #define PIN_SDA           21
 #define PIN_SCL           22
 #define PIN_ENTRY         36
 
-/*
- * I2c == 22, 21
-*/
 #define DHT_TYPE          DHT11
+#define ENTRY_VOLTAGE_TARGET 5.0
 
 /*
  * Sensor Values
@@ -125,8 +124,6 @@ char              gcTemp[48],                 // Current Temperature Formatted
                   gcHumid[48],                // Current Humidity Formatted
                   gcPosition[48],             // Current VL53L0X Positon Formatted
                   gcEntry[48];                // Current ADC Entry value
-
-
 
 String            pchmotionON  = F("Motion: ON "), // String constants for logging
                   pchmotionOFF = F("Motion: OFF"),
@@ -167,7 +164,7 @@ unsigned long IRAM_ATTR setDuration(unsigned long duration) {
 void IRAM_ATTR motionInterruptHandler() {
   gulMotionDuration = setDuration( 600000UL ); // Wait 10 min for an entry
   gvMotion = true;
-  gvLastMotion = false;
+  // gvLastMotion = false;
 }
 
 void IRAM_ATTR loxInterruptHandler() {
@@ -188,20 +185,20 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
   if (value == pchON || value == "true" || value == "on") {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
     gulLoxDuration   = setDuration( 60000UL ); // LOX read for 60 seconds   
-    gbLOXReady       = true;
+    // gbLOXReady       = true;
     gbLOXRunMode     = true;
-    digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
-      delay(100);
+    digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
+    delay(200);
+    digitalWrite(PIN_RELAY, HIGH );
+    delay(375);
       lox.setSignalRateLimit(0.1);
       lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
       lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
       lox.setMeasurementTimingBudget(200000);
-      lox.startContinuous(500); // total should be around 250ms per reading
-    taskYIELD();
-
-    digitalWrite(PIN_RELAY, HIGH );
-    delay(500);
+      lox.startContinuous(500); // total should be around 500ms per reading
+    delay(375);
     digitalWrite(PIN_RELAY, LOW );
+    taskYIELD();
     garageNode.setProperty(PROP_RELAY).send( pchOFF );
   } 
   return true;
@@ -215,7 +212,7 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
 void gatherPosition() {
   if ( gbLOXReady && (guiTimeBase >= gulLoxDuration)) {
     if (gbLOXRunMode) {
-      digitalWrite(PIN_SHDN, LOW);   // H to enable, L to disable -- might also reset
+      digitalWrite(PIN_L0X_SHDN, LOW);   // H to enable, L to disable -- might also reset
       gbLOXRunMode = false;
     }
     gbLOXReady = false;
@@ -252,6 +249,11 @@ void gatherPosition() {
  * - Value ranges from 20 to 21.5 when triggered
  * - runs for 15 min after door operates
 */
+
+float sknAdcToVolts(int value) {
+  return (float)((value / 4096.0) * ENTRY_VOLTAGE_TARGET) * 10.0;
+}
+
 void gatherEntry( ) {
   /*
     * 4.9vdc produces a reading of 1058 ish 
@@ -262,7 +264,7 @@ void gatherEntry( ) {
       giEntryCount++;  
       garageNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
       Homie.getLogger() << "Entries: " << giEntryCount 
-                        << ", Volts: " << (float)(((giEntry - 170) / 4096.0) * 25)
+                        << ", Volts: " << sknAdcToVolts(giEntry)
                         << ", Raw: " << giEntry 
                         << ", Min: " << giEntryMin
                         << ", Max: " << giEntryMax << endl;
@@ -270,7 +272,6 @@ void gatherEntry( ) {
     giEntryMax = giEntry > giEntryMax ? giEntry : giEntryMax ;
     giEntryMin = giEntry < giEntryMin ? giEntry : giEntryMin ;
     giLastEntry = giEntry;  
-
   }
 }
 
@@ -303,8 +304,8 @@ void gatherTemps() {   // called every status interval
     gfTemperature = dht.toFahrenheit(newValues.temperature); 
     gfHumidity = newValues.humidity;
 
-    snprintf(gcTemps, sizeof(gcTemps), "%.1f", gfTemperature);
-    garageNode.setProperty(PROP_TEMP).send(gcTemps);
+    snprintf(gcTemp, sizeof(gcTemp), "%.1f", gfTemperature);
+    garageNode.setProperty(PROP_TEMP).send(gcTemp);
   
     snprintf(gcHumid, sizeof(gcHumid), "%.1f", gfHumidity);
     garageNode.setProperty(PROP_HUM).send(gcHumid);      
@@ -324,7 +325,7 @@ void displaySensors() {
       gbDisplayOn = true;
     } 
     
-    snprintf(gcEntry, sizeof(gcEntry), "C:%d Vdc:%.2f", giEntryCount, (float)(((giEntry - 170) / 4096.0) * 25) );
+    snprintf(gcEntry, sizeof(gcEntry), "C:%d Vdc:%.2f", giEntryCount, sknAdcToVolts(giEntry));
     snprintf(gcTemps, sizeof(gcTemps), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
     snprintf(gcPosition, sizeof(gcPosition), "P:%hd R:%hd", giLastLOXValue, giLOX );
 
@@ -363,12 +364,12 @@ void onHomieEvent(const HomieEvent& event) {
       break;
     case HomieEventType::WIFI_DISCONNECTED:
       Serial << "Wi-Fi disconnected, reason: " << (int8_t)event.wifiReason << endl;
-      detachInterrupt(PIN_L0X); 
+      detachInterrupt(PIN_L0X_INTR); 
       detachInterrupt(PIN_MOTION); 
       break;      
     case HomieEventType::MQTT_READY:
       Serial << "MQTT connected, core: " << xPortGetCoreID() << endl;
-      attachInterrupt(PIN_L0X, loxInterruptHandler, FALLING); 
+      attachInterrupt(PIN_L0X_INTR, loxInterruptHandler, FALLING); 
       attachInterrupt(PIN_MOTION, motionInterruptHandler, RISING); 
       break;
     case HomieEventType::MQTT_DISCONNECTED:
@@ -414,19 +415,11 @@ void homieLoopHandler() {
   }
 }
 
-void homieSetupHandler() {
-  Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
-
-  Wire.begin(PIN_SDA, PIN_SCL, 400000);
-  delay(50);
-
-  dht.setup(PIN_DHT, DHTesp::DHT11);
-  delay(50);
-
-  /*
-   * Initialising the display.
-   * create fonts at http://oleddisplay.squix.ch/
-  */ 
+ /*
+  * Initialising the display.
+  * create fonts at http://oleddisplay.squix.ch/
+*/ 
+void initializeDisplay() {
   display.init();
   display.flipScreenVertically();
   display.clear();
@@ -437,6 +430,18 @@ void homieSetupHandler() {
   display.drawString(0, 32, "0123456789ABC");
   display.display();
   delay(50);
+}
+
+void homieSetupHandler() {
+  Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
+
+  Wire.begin(PIN_SDA, PIN_SCL, 400000L);
+  delay(50);
+
+  dht.setup(PIN_DHT, DHTesp::DHT11);
+  delay(50);
+
+  initializeDisplay();
 
   /*
    * lower the return signal rate limit (default is 0.25 MCPS)
@@ -450,10 +455,10 @@ void homieSetupHandler() {
   lox.setTimeout(500);
   if (!gbValue) { 
     Serial.println("Failed to detect and initialize VL53L0X sensor! (1)");
-      digitalWrite(PIN_SHDN, LOW); 
+      digitalWrite(PIN_L0X_SHDN, LOW); 
       taskYIELD();
       delay(1000);
-      digitalWrite(PIN_SHDN, HIGH); 
+      digitalWrite(PIN_L0X_SHDN, HIGH); 
       taskYIELD();
     gbValue = lox.init(); // try again
   }
@@ -464,12 +469,13 @@ void homieSetupHandler() {
     delay(2000);
     ESP.restart();
   }
-  delay(50);
+  delay(500);
   lox.setSignalRateLimit(0.1);
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
   lox.setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
   lox.setMeasurementTimingBudget(200000);
   lox.startContinuous(500); // total should be around 250ms per reading
+  delay(500);
 }
 
 void setup() {
@@ -482,14 +488,14 @@ void setup() {
 
   pinMode(PIN_ENTRY,  INPUT);     // analog sensor of IR door break 20.0vdc = off, 21.5vdc = on
   pinMode(PIN_MOTION, INPUT);     // RCWL sensor
-  pinMode(PIN_L0X,    INPUT);     // VL53L0X Interrupt Ready Pin
+  pinMode(PIN_L0X_INTR, INPUT);   // VL53L0X Interrupt Ready Pin
   pinMode(PIN_RELAY, OUTPUT);     // Door operator
-  pinMode(PIN_SHDN, OUTPUT);      // VL53L0X Shutdown/Enable
+  pinMode(PIN_L0X_SHDN, OUTPUT);  // VL53L0X Shutdown/Enable
   digitalWrite(PIN_RELAY, LOW);   // Init door to off
-  digitalWrite(PIN_SHDN, HIGH);   // H to enable, L to disable -- might also reset
+  digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 
   /* Turn off Distance and Entry Readings */
-  gulTempsDuration = gulEntryDuration = gulLoxDuration = millis(); // setDuration( 1000UL );
+  gulTempsDuration = gulEntryDuration = gulLoxDuration = setDuration( 5000UL );
 
   /*
    * Voltage divider analog in pins
