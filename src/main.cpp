@@ -66,8 +66,8 @@
 #define SKN_DOOR_NODE_NAME  "door"
 #define SKN_DOOR_NODE_TITLE "Operations"
 
-#define SKN_ENV_NODE_NAME "environment"
-#define SKN_ENV_NODE_TITLE "Environment"
+#define SKN_ENV_NODE_NAME "environmentMonitor"
+#define SKN_ENV_NODE_TITLE "Multi-Sensor"
 
 #define PROP_ENTRY        "entry"
 #define PROP_ENTRY_TITLE  "Entries"
@@ -186,30 +186,50 @@ bool broadcastHandler(const String& level, const String& value) {
 /** 
  *  Re Enable VL53L1X after havin been ShutDown
 */
-void enableRanging() {
-  lox.setDistanceMode(VL53L1X::Medium);
-  lox.setMeasurementTimingBudget(200000);
-  lox.startContinuous(200); // total should be around 400ms per reading
+void enableRanging(unsigned long durationMS) {
+  Homie.getLogger() << "Restoring VL53L1X ranging. " << endl;
+  digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
+  gbLOXReady = false;
+
+  if (!gbDisplayOn) { // on same bus as ranger; cause odd problems if off
+    gbDisplayOn = true;
+    display.displayOn();
+    display.display();
+  }
+  delay(100);
+
+  lox.setDistanceMode( VL53L1X::Long );
+  lox.setMeasurementTimingBudget( 150000 );
+  lox.startContinuous( 100 ); // total should be around 250ms per reading
+
+  Homie.getLogger() << "VL53L1X getDistanceMode()=" <<  lox.getDistanceMode()  << endl;
+  Homie.getLogger() << "VL53L1X getMeasurementTimingBudget()=" <<  lox.getMeasurementTimingBudget()  << endl;
+
+  gulLoxDuration = setDuration( durationMS );  // LOX read for 60 seconds   
+  gbLOXRunMode   = true;                       // Release Ranging data collection routines
+  Homie.getLogger() << "VL53L1X ranging enabled for " << (durationMS/1000.0) << " seconds." << endl;
+  delay(250);
 }
 
 /**
  * When door is operated release the Entry counter and the Distance Ranger
 */
-bool doorOperatorHandler(const HomieRange& range, const String& value) {
+bool operationsHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
   if (value == pchON || value == "true" || value == "on") {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
-    gulLoxDuration   = setDuration( 60000UL ); // LOX read for 60 seconds   
-    gbLOXRunMode     = true;
-    digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
-    delay(200);
+
+    enableRanging(60000UL);                  // Enable Ranging
+
     digitalWrite(PIN_RELAY, HIGH );     // activate door relay
-    delay(375);
-      enableRanging();                // Enable Ranging
-    delay(375);
+      delay(750);
     digitalWrite(PIN_RELAY, LOW );      // de-activate door relay
+
+    // yield(); 
     taskYIELD();
     doorNode.setProperty(PROP_RELAY).send( pchOFF );
+
+    Homie.getLogger() << "Exit ON operation. " << endl;
   } 
   return true;
 }
@@ -498,7 +518,7 @@ bool initializeRanging() {
     ESP.restart();
   }
 
-  enableRanging();                // Enable Ranging
+  enableRanging(2000UL);                // Enable Ranging
   delay(500);
 
   return gbValue;
@@ -534,8 +554,8 @@ void setup() {
   digitalWrite(PIN_RELAY, LOW);   // Init door to off
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 
-  /* Turn off Distance and Entry Readings */
-  gulTempsDuration = gulEntryDuration = gulLoxDuration = setDuration( 5000UL );
+  /* Collect a few values for temps, entry. */
+  gulTempsDuration = gulEntryDuration = setDuration( 2000UL );
 
   /*
    * Voltage divider analog in pins
@@ -561,7 +581,7 @@ void setup() {
   doorNode.advertise(PROP_RELAY)
             .setName(PROP_RELAY_TITLE)
             .setRetained(true)
-            .settable(doorOperatorHandler)
+            .settable(operationsHandler)
             .setDatatype("boolean")
             .setFormat("%s");
 
