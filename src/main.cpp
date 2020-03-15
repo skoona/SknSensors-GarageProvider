@@ -46,6 +46,7 @@
 #include <driver/adc.h>
 
 #include <Homie.h>
+
 #include <Wire.h>
 #include "SSD1306Wire.h"
 #include <VL53L1X.h>
@@ -57,12 +58,16 @@
 #error Select ESP32 board.
 #endif
 
-#define SKN_MOD_NAME    "GarageDoor"
-#define SKN_MOD_VERSION "0.6.0"
+#define SKN_MOD_NAME    "GarageProvider"
+#define SKN_MOD_VERSION "0.9.0"
 #define SKN_MOD_BRAND   "SknSensors"
-#define SKN_MOD_TITLE   "Provider"
+#define SKN_MOD_TITLE   "Operations"
 
-#define NODE_NAME       "Door Control"
+#define SKN_DOOR_NODE_NAME  "door"
+#define SKN_DOOR_NODE_TITLE "Operations"
+
+#define SKN_ENV_NODE_NAME "environment"
+#define SKN_ENV_NODE_TITLE "Environment"
 
 #define PROP_ENTRY        "entry"
 #define PROP_ENTRY_TITLE  "Entries"
@@ -87,7 +92,7 @@
 #define PIN_ENTRY         36
 
 #define DHT_TYPE          DHT11
-#define ENTRY_VOLTAGE_BASE 3.3
+#define ENTRY_VOLTAGE_BASE 0.065     // correction for voltage divider
 
 /*
  * Sensor Values
@@ -108,6 +113,7 @@ volatile int      giEntry            = 0,     // value of beam break ADC
 volatile bool     gbLOXReady         = true,  // VL53L1X startup -- Interrupt
                   gbLOXRunMode       = true,  // VL53L1X startup 
                   gbDisplayOn        = true,  // Display SHOULD be on or off    
+                  gbDisplayInitialized = false, // Has display be setup?
                   gvDuration         = false, // 1/2 second marker
                   gbValue            = false, // initialization boolean, general use
                   gvMotion           = false, // Motion indicator value -- Interrupt
@@ -148,7 +154,8 @@ SSD1306Wire display(0x3c, PIN_SDA, PIN_SCL, GEOMETRY_128_64);
 */
 VL53L1X lox;
 
-HomieNode garageNode(SKN_MOD_NAME, NODE_NAME, SKN_MOD_BRAND);
+HomieNode doorNode(SKN_DOOR_NODE_NAME, SKN_DOOR_NODE_TITLE, SKN_MOD_BRAND);
+HomieNode envNode(SKN_ENV_NODE_NAME, SKN_ENV_NODE_TITLE, SKN_MOD_BRAND);
 
 /**
  * Utility to handle Duration Roll Overs
@@ -176,6 +183,14 @@ bool broadcastHandler(const String& level, const String& value) {
   return true;
 }
 
+/** 
+ *  Re Enable VL53L1X after havin been ShutDown
+*/
+void enableRanging() {
+  lox.setDistanceMode(VL53L1X::Medium);
+  lox.setMeasurementTimingBudget(200000);
+  lox.startContinuous(200); // total should be around 400ms per reading
+}
 
 /**
  * When door is operated release the Entry counter and the Distance Ranger
@@ -185,19 +200,16 @@ bool doorOperatorHandler(const HomieRange& range, const String& value) {
   if (value == pchON || value == "true" || value == "on") {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
     gulLoxDuration   = setDuration( 60000UL ); // LOX read for 60 seconds   
-    // gbLOXReady       = true;
     gbLOXRunMode     = true;
     digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
     delay(200);
-    digitalWrite(PIN_RELAY, HIGH );
+    digitalWrite(PIN_RELAY, HIGH );     // activate door relay
     delay(375);
-      lox.setDistanceMode(VL53L1X::Long);
-      lox.setMeasurementTimingBudget(200000);
-      lox.startContinuous(500); // total should be around 500ms per reading
+      enableRanging();                // Enable Ranging
     delay(375);
-    digitalWrite(PIN_RELAY, LOW );
+    digitalWrite(PIN_RELAY, LOW );      // de-activate door relay
     taskYIELD();
-    garageNode.setProperty(PROP_RELAY).send( pchOFF );
+    doorNode.setProperty(PROP_RELAY).send( pchOFF );
   } 
   return true;
 }
@@ -227,7 +239,7 @@ void gatherPosition() {
       giLastLOXValue = giLOX;
       gbLOXReady = false;
       
-      garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+      doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
 
       Homie.getLogger() << F("VL53L1X Read: ") << giLastLOXValue 
                         << ", Raw: " << giLOX 
@@ -247,9 +259,14 @@ void gatherPosition() {
  * - Value ranges from 20 to 21.5 when triggered
  * - runs for 15 min after door operates
 */
+double sknAdcToVolts(int value) {
+  double reading = value * 1.0; // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
+  if(reading < 1 || reading > 4095) {
+    return 0.0;
+  }
 
-float sknAdcToVolts(int value) {
-  return (float)(((value / 4096.0) * ENTRY_VOLTAGE_BASE) * 10.0) / 0.49;
+  reading =  -0.000000000000016 * pow(reading,4) + 0.000000000118171 * pow(reading,3)- 0.000000301211691 * pow(reading,2)+ 0.001109019271794 * reading + 0.034143524634089;
+  return ((reading + ENTRY_VOLTAGE_BASE) * 10.0); // scale to d.dd
 }
 
 void gatherEntry( ) {
@@ -260,7 +277,7 @@ void gatherEntry( ) {
   if ( giEntry != giLastEntry ) { // 20 to 21.5 volts, 
     if (giEntry > giEntryMax) {
       giEntryCount++;  
-      garageNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
+      doorNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
       Homie.getLogger() << "Entries: " << giEntryCount 
                         << ", Volts: " << sknAdcToVolts(giEntry)
                         << ", Raw: " << giEntry 
@@ -271,6 +288,7 @@ void gatherEntry( ) {
     giEntryMin = giEntry < giEntryMin ? giEntry : giEntryMin ;
     giLastEntry = giEntry;  
   }
+  yield();
 }
 
 /**
@@ -280,16 +298,17 @@ void gatherEntry( ) {
 */
 void gatherMotion(bool stats = false ) { 
   if (gvLastMotion != gvMotion) {
-    garageNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF));
+    envNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF));
     Homie.getLogger() << (gvMotion ? pchmotionON : pchmotionOFF) << endl;
     gvLastMotion = gvMotion;
   }
 
   if (stats) {
     gvLastMotion = gvMotion = false;
-    garageNode.setProperty(PROP_MOTION).send(pchOFF);
+    envNode.setProperty(PROP_MOTION).send(pchOFF);
     Homie.getLogger() << pchmotionOFF << endl;
   }
+  yield();
 }
 
 /**
@@ -303,12 +322,13 @@ void gatherTemps() {   // called every status interval
     gfHumidity = newValues.humidity;
 
     snprintf(gcTemp, sizeof(gcTemp), "%.1f", gfTemperature);
-    garageNode.setProperty(PROP_TEMP).send(gcTemp);
+    envNode.setProperty(PROP_TEMP).send(gcTemp);
   
     snprintf(gcHumid, sizeof(gcHumid), "%.1f", gfHumidity);
-    garageNode.setProperty(PROP_HUM).send(gcHumid);      
+    envNode.setProperty(PROP_HUM).send(gcHumid);      
   }     
   gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
+  yield();
 }
 
 /**
@@ -340,6 +360,7 @@ void displaySensors() {
       display.displayOff();
     }
   }
+  yield();
 }
 
 /**
@@ -347,31 +368,50 @@ void displaySensors() {
  * - Only during stats cycle
 */
 void sendSensorStats() {
-  garageNode.setProperty(PROP_TEMP).send(gcTemp);
-  garageNode.setProperty(PROP_HUM).send(gcHumid); 
+  envNode.setProperty(PROP_TEMP).send(gcTemp);
+  envNode.setProperty(PROP_HUM).send(gcHumid); 
   
-  garageNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF)); 
-  garageNode.setProperty(PROP_ENTRY).send(String(giEntryCount));  
-  garageNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+  envNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF)); 
+  doorNode.setProperty(PROP_ENTRY).send(String(giEntryCount));  
+  doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+  yield();
+}
+
+void displayEvent(String eventName, String eventMessage) {
+  if (gbDisplayInitialized) {
+    if(!gbDisplayOn) {
+      display.displayOn();
+      gbDisplayOn = true;
+    }
+
+    display.clear();
+      display.drawString(0,0, eventName);
+      display.drawString(0,16, eventMessage);
+    display.display();
+  }
+  yield();
 }
 
 void onHomieEvent(const HomieEvent& event) {
   switch (event.type) {
     case HomieEventType::NORMAL_MODE:
-      Serial << "Normal mode started, core: " << xPortGetCoreID() << endl;
+      Serial << "Normal mode started, core: " << xPortGetCoreID() << endl;      
       break;
     case HomieEventType::WIFI_DISCONNECTED:
       Serial << "Wi-Fi disconnected, reason: " << (int8_t)event.wifiReason << endl;
-      detachInterrupt(PIN_L0X_INTR); 
-      detachInterrupt(PIN_MOTION); 
+      displayEvent( "Wi-Fi disconnected", String((int8_t)event.wifiReason));
       break;      
     case HomieEventType::MQTT_READY:
       Serial << "MQTT connected, core: " << xPortGetCoreID() << endl;
+      displayEvent( "MQTT", "READY");
       attachInterrupt(PIN_L0X_INTR, loxInterruptHandler, FALLING); 
       attachInterrupt(PIN_MOTION, motionInterruptHandler, RISING); 
       break;
     case HomieEventType::MQTT_DISCONNECTED:
       Serial << "MQTT disconnected, reason: " << (int8_t)event.mqttReason << endl;
+      displayEvent( "MQTT disconnected", String((int8_t)event.mqttReason));
+      detachInterrupt(PIN_L0X_INTR); 
+      detachInterrupt(PIN_MOTION); 
       break;
     case HomieEventType::SENDING_STATISTICS:
       Serial << "Sending statistics, core: " << xPortGetCoreID() << endl;
@@ -411,6 +451,7 @@ void homieLoopHandler() {
     displaySensors();
     gulLastTimeBase = guiTimeBase;
   }
+  yield();
 }
 
  /*
@@ -427,27 +468,16 @@ void initializeDisplay() {
   display.drawString(40, 16, SKN_MOD_VERSION);
   display.drawString(0, 32, "0123456789ABC");
   display.display();
-  delay(50);
+  gbDisplayInitialized = true;
+  yield();
 }
 
-void homieSetupHandler() {
-  Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
-
-  Wire.begin(PIN_SDA, PIN_SCL, 400000L);
-  delay(50);
-
-  dht.setup(PIN_DHT, DHTesp::DHT11);
-  delay(50);
-
-  initializeDisplay();
-
-  /*
-   * lower the return signal rate limit (default is 0.25 MCPS)
-   * increase laser pulse periods (defaults are 14 and 10 PCLKs)
-   * increase timing budget to 200 ms
-   * Use continuous timed mode and provide the desired 
-   * inter-measurement period in ms (e.g. sensor.startContinuous(250)).
-  */
+/**
+ * lower the return signal rate limit (default is 0.25 MCPS)
+ * increase timing budget to 200 ms
+ * inter-measurement period in ms (e.g. sensor.startContinuous(250)).
+*/
+bool initializeRanging() {
   lox.setTimeout(500);
   gbValue = lox.init();
   lox.setTimeout(500);
@@ -467,11 +497,25 @@ void homieSetupHandler() {
     delay(2000);
     ESP.restart();
   }
+
+  enableRanging();                // Enable Ranging
   delay(500);
-    lox.setDistanceMode(VL53L1X::Long);
-    lox.setMeasurementTimingBudget(200000);
-    lox.startContinuous(500); // total should be around 500ms per reading
-  delay(500);
+
+  return gbValue;
+}
+
+void homieSetupHandler() {
+  Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
+
+  Wire.begin(PIN_SDA, PIN_SCL, 400000L);
+  delay(50);
+
+  dht.setup(PIN_DHT, DHTesp::DHT11);
+  delay(50);
+
+  initializeDisplay();
+  initializeRanging();
+  yield();
 }
 
 void setup() {
@@ -514,49 +558,49 @@ void setup() {
       .onEvent(onHomieEvent)  
       .setSetupFunction(homieSetupHandler);
   
-  garageNode.advertise(PROP_RELAY)
+  doorNode.advertise(PROP_RELAY)
             .setName(PROP_RELAY_TITLE)
             .setRetained(true)
             .settable(doorOperatorHandler)
             .setDatatype("boolean")
             .setFormat("%s");
 
-  garageNode.advertise(PROP_MOTION)
-            .setName(PROP_MOTION_TITLE)
-            .setRetained(true)
-            .setDatatype("string")
-            .setFormat("%s");
-
-  garageNode.advertise(PROP_TEMP)
-            .setName(PROP_TEMP_TITLE)
-            .setDatatype("float")
-            .setFormat("%.1f")
-            .setUnit("ºF");
-
-  garageNode.advertise(PROP_HUM)
-            .setName(PROP_HUM_TITLE)
-            .setDatatype("float")
-            .setFormat("%.1f")
-            .setUnit("%");  
-
-  garageNode.advertise(PROP_ENTRY)
+  doorNode.advertise(PROP_ENTRY)
             .setName(PROP_ENTRY_TITLE)
             .setDatatype("integer")
             .setRetained(true)
             .setFormat("%d")
             .setUnit("#");
 
-  garageNode.advertise(PROP_POS)
+  doorNode.advertise(PROP_POS)
             .setName(PROP_POS_TITLE)
             .setDatatype("integer")
             .setRetained(true)
             .setFormat("%d")
             .setUnit("#");
 
+  envNode.advertise(PROP_MOTION)
+            .setName(PROP_MOTION_TITLE)
+            .setRetained(true)
+            .setDatatype("string")
+            .setFormat("%s");
+
+  envNode.advertise(PROP_TEMP)
+            .setName(PROP_TEMP_TITLE)
+            .setDatatype("float")
+            .setFormat("%.1f")
+            .setUnit("ºF");
+
+  envNode.advertise(PROP_HUM)
+            .setName(PROP_HUM_TITLE)
+            .setDatatype("float")
+            .setFormat("%.1f")
+            .setUnit("%");  
 
   Homie.setup();
 }
 
 void loop() {
   Homie.loop();
+  yield();
 }

@@ -1,7 +1,7 @@
 {
-    "name": "Garage Door Opener",
+    "name": "Garage Door Operations",
     "device_id": "GarageProvider",
-  "device_stats_interval": 180,  
+  "device_stats_interval": 300,  
   "wifi": {
     "ssid": "SFNSS1-24G",
     "password": "Apache Tomcat 8"
