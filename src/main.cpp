@@ -1,5 +1,6 @@
 /**
- * Module: GarageDoor
+ * Module: GarageProvider
+ *  Nodes: door, environmentMonitor
  *  Data:  data/homie/config.json, 
  *         data/homie/ui_bundle.gz
  *  Created:  02/22/2020
@@ -9,23 +10,24 @@
  *  - Temperature, Humidity, Motion, EntryCount, and Door Position.
  *  When humans are detected send notice once per stats interval, interval will reset
  *  When analog change from saftey beam, record entry/exit.
- *  When door operates broadcast door position change every 1/2 second for 30 seconds
+ *  When door operates broadcast door position change every 1/2 second for 60 seconds
  *  - maybe decode moving up or down, and open/closed from home/max
  *  On handler command pulse Relay to open/close door opener, and reset position timer
- *  Position uses an interrupt to read data, disabling VL53L1X when not in use corrupts the I2c channel!
- *  - also attach/detach interrupt with WiFi enablement/disablement
+ *  Position uses an interrupt to read data, disabling VL53L1X when not in use.
+ *  - OLED Display must be enabled and on for I2c to be stable for VL53L1X operations
+ *  - also attach/detach interrupt with MQTT enablement/disablement
  * 
- * *   PIN Description  Supply  Trigger
+ * *   PIN Description    Supply  Trigger
  * =============================================================================
- * *    D7 RCWL-0516      5V    HIGH (3.3V)   if motion detected. 0V normally.
+ * *    D7 RCWL-0516      5V      HIGH (3.3V)   if motion detected. 0V normally.
  * -    D7 Motion-Detected Interrupt          INTR-RISING
- * *    D5 RELAY        3.3V    HIGH
- * *    D6 DHT-11         5V    Data/OneWire  Temperature/Humidity
- * *    A0 Volt/Divider 21.5V   ADC           Sensor 100K/16 (120K/12K={21.5=1.955v}{20.0/1.818v})
- * * D1/D2 VL53L1X        3.3V  I2c           Line of Sight Ranger
- * -    D4 Data-Ready Interrupt GPIO          INTR-FALLING 
- * -    D3 Shutdown Pin   3.3V  GPIO          High for normal Operations, can reset VL53L1X
- * * D1/D2 OLED 128x64    3.3V  I2c SSD1306   Display
+ * *    D5 RELAY          3.3V    HIGH
+ * *    D6 DHT-11         5V      Data/OneWire  Temperature/Humidity
+ * *    A0 Volt/Divider  21.5V    ADC           Sensor 100K/16 (120K/12K={21.5=1.955v}{20.0/1.818v})
+ * * D1/D2 VL53L1X        3.3V    I2c           Line of Sight Ranger 4m max
+ * -    D8 Data-Ready Interrupt   GPIO          INTR-FALLING 
+ * -    D3 Shutdown Pin   3.3V    GPIO          High for normal Operations, can reset VL53L1X
+ * * D1/D2 OLED 128x64    3.3V    I2c SSD1306   Display
  * =============================================================================
  * 
  * 
@@ -80,11 +82,16 @@
 #define PROP_HUM          "humdity"
 #define PROP_HUM_TITLE    "Humidity"
 #define PROP_POS          "positon"
-#define PROP_POS_TITLE    "Position"
+#define PROP_POS_TITLE    "Position MM"
+#define PROP_ACTION       "direction"
+#define PROP_ACTION_TITLE "Travel Direction"
+#define POSITION_OPEN      162 // mm, within 6 inches
+#define POSITION_CLOSED   2280 // mm, outside 7.5 feet
+
 
 #define PIN_DHT           19
 #define PIN_MOTION        23
-#define PIN_L0X_INTR      5 // 5 works
+#define PIN_L0X_INTR      5 
 #define PIN_L0X_SHDN      16
 #define PIN_RELAY         18
 #define PIN_SDA           21
@@ -92,7 +99,7 @@
 #define PIN_ENTRY         36
 
 #define DHT_TYPE          DHT11
-#define ENTRY_VOLTAGE_BASE 0.065     // correction for voltage divider
+#define ENTRY_VOLTAGE_BASE 0.65 // 0.065440348345433     // correction for voltage divider
 
 /*
  * Sensor Values
@@ -101,19 +108,19 @@ volatile unsigned long guiTimeBase   = 0,     // default time base, target 0.5 s
                   gulLastTimeBase    = 0,     // time base delta
                   gulTempsDuration   = 0,     // time between each temp measurement
                   gulMotionDuration  = 0,     // time to hold motion after trigger interrupt
-                  gulLoxDuration     = 0,     // time to run VL53L1X after door operates
+                  gulRangingDuration = 0,     // time to run VL53L1X after door operates
                   gulEntryDuration   = 0;     // time to run beam break monitor after door operates
 
 volatile int      giEntry            = 0,     // value of beam break ADC
-                  giEntryMax         = 600,   // open value of ADC reading -- break
-                  giEntryMin         = 600,   // close value of ADC reading -- no break
+                  giEntryMax         = 2375,  // computed range 2426: 21.5v open value of ADC reading -- break
+                  giEntryMin         = 2200,  // computed value 2256: 20.0v close value of ADC reading -- no break
                   giEntryCount       = 0,     // count of number of entries since startup
                   giLastEntry        = 10;    // ADC reading of last entry    
 
 volatile bool     gbLOXReady         = true,  // VL53L1X startup -- Interrupt
                   gbLOXRunMode       = true,  // VL53L1X startup 
                   gbDisplayOn        = true,  // Display SHOULD be on or off    
-                  gbDisplayInitialized = false, // Has display be setup?
+                  gbDisplayInitialized = false, // Has display be setup? Alerts for HomieEvents
                   gvDuration         = false, // 1/2 second marker
                   gbValue            = false, // initialization boolean, general use
                   gvMotion           = false, // Motion indicator value -- Interrupt
@@ -129,6 +136,7 @@ char              gcTemp[48],                 // Current Temperature Formatted
                   gcTemps[48],                // Combined Temperature and Humidity Formatted
                   gcHumid[48],                // Current Humidity Formatted
                   gcPosition[48],             // Current VL53L1X Positon Formatted
+                  gcDirection[48],            // Direction of Door Travel
                   gcEntry[48];                // Current ADC Entry value
 
 String            pchmotionON  = F("Motion: ON "), // String constants for logging
@@ -154,15 +162,20 @@ SSD1306Wire display(0x3c, PIN_SDA, PIN_SCL, GEOMETRY_128_64);
 */
 VL53L1X lox;
 
+/* 
+ * Two Homie Nodes to reflect device activity
+ * - Door Operations and Status
+ * - Environment and Human Presence
+*/
 HomieNode doorNode(SKN_DOOR_NODE_NAME, SKN_DOOR_NODE_TITLE, SKN_MOD_BRAND);
 HomieNode envNode(SKN_ENV_NODE_NAME, SKN_ENV_NODE_TITLE, SKN_MOD_BRAND);
 
-/**
+/*
  * Utility to handle Duration Roll Overs
 */
 unsigned long IRAM_ATTR setDuration(unsigned long duration) {
   unsigned long value = millis() + duration;
-  if (value <= duration) { // rolled
+  if (value < duration) { // rolled
     value = duration;
   } 
   return value;
@@ -171,7 +184,6 @@ unsigned long IRAM_ATTR setDuration(unsigned long duration) {
 void IRAM_ATTR motionInterruptHandler() {
   gulMotionDuration = setDuration( 600000UL ); // Wait 10 min for an entry
   gvMotion = true;
-  // gvLastMotion = false;
 }
 
 void IRAM_ATTR loxInterruptHandler() {
@@ -191,24 +203,20 @@ void enableRanging(unsigned long durationMS) {
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
   gbLOXReady = false;
 
-  if (!gbDisplayOn) { // on same bus as ranger; cause odd problems if off
-    gbDisplayOn = true;
-    display.displayOn();
-    display.display();
-  }
-  delay(100);
-
   lox.setDistanceMode( VL53L1X::Long );
+  delay(50);
   lox.setMeasurementTimingBudget( 150000 );
-  lox.startContinuous( 100 ); // total should be around 250ms per reading
+  delay(50);
+  lox.startContinuous( 150 ); // total should be around 250ms per reading
+  delay(50);
 
   Homie.getLogger() << "VL53L1X getDistanceMode()=" <<  lox.getDistanceMode()  << endl;
   Homie.getLogger() << "VL53L1X getMeasurementTimingBudget()=" <<  lox.getMeasurementTimingBudget()  << endl;
 
-  gulLoxDuration = setDuration( durationMS );  // LOX read for 60 seconds   
+  gulRangingDuration = setDuration( durationMS );  // LOX read for 60 seconds   
   gbLOXRunMode   = true;                       // Release Ranging data collection routines
   Homie.getLogger() << "VL53L1X ranging enabled for " << (durationMS/1000.0) << " seconds." << endl;
-  delay(250);
+  delay(300);
 }
 
 /**
@@ -240,7 +248,7 @@ bool operationsHandler(const HomieRange& range, const String& value) {
  * - Time controlled by caller and/or Door Operator
  */
 void gatherPosition() {
-  if ( gbLOXReady && (guiTimeBase >= gulLoxDuration)) {
+  if ( gbLOXReady && (guiTimeBase >= gulRangingDuration)) {
     if (gbLOXRunMode) {
       digitalWrite(PIN_L0X_SHDN, LOW);   // H to enable, L to disable -- might also reset
       gbLOXRunMode = false;
@@ -256,14 +264,27 @@ void gatherPosition() {
   if (gbLOXReady) {
     giLOX = lox.read(); // read data value
     if (!lox.timeoutOccurred() && giLOX > 1 && giLOX < 8100) {
-      giLastLOXValue = giLOX;
-      gbLOXReady = false;
-      
+                              
+      if (giLOX < giLastLOXValue) { // moving up
+        snprintf(gcDirection, sizeof(gcDirection), "%s", "OPENING" );
+      } else if (giLOX > giLastLOXValue) { // moving down
+        snprintf(gcDirection, sizeof(gcDirection), "%s", "CLOSING" );
+      } else if (giLOX < POSITION_OPEN  ) { // open
+        snprintf(gcDirection, sizeof(gcDirection), "%s", "OPEN" );
+      } else if (giLOX > POSITION_CLOSED) { // closed
+        snprintf(gcDirection, sizeof(gcDirection), "%s", "CLOSED" );
+      }
+
       doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+      doorNode.setProperty(PROP_ACTION).send(gcDirection);
 
       Homie.getLogger() << F("VL53L1X Read: ") << giLastLOXValue 
                         << ", Raw: " << giLOX 
+                        << ", Direction: " << gcDirection
                         << endl;      
+
+      giLastLOXValue = giLOX;
+      gbLOXReady = false;
       
     } else {
       Homie.getLogger() << F("VL53L1X Timeout or Out of Range: ") << lox.last_status  << endl;
@@ -280,10 +301,11 @@ void gatherPosition() {
  * - runs for 15 min after door operates
 */
 double sknAdcToVolts(int value) {
-  double reading = value * 1.0; // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
-  if(reading < 1 || reading > 4095) {
-    return 0.0;
+  if(value < 1 || value > 4095) {
+    return 1.0;
   }
+
+  double reading = value * 1.0; // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
 
   reading =  -0.000000000000016 * pow(reading,4) + 0.000000000118171 * pow(reading,3)- 0.000000301211691 * pow(reading,2)+ 0.001109019271794 * reading + 0.034143524634089;
   return ((reading + ENTRY_VOLTAGE_BASE) * 10.0); // scale to d.dd
@@ -295,7 +317,7 @@ void gatherEntry( ) {
     * should run inside doorPosition min/max limits   */    
   giEntry = adc1_get_raw(ADC1_CHANNEL_0);
   if ( giEntry != giLastEntry ) { // 20 to 21.5 volts, 
-    if (giEntry > giEntryMax) {
+    if (giEntry >= giEntryMax) {
       giEntryCount++;  
       doorNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
       Homie.getLogger() << "Entries: " << giEntryCount 
@@ -316,18 +338,19 @@ void gatherEntry( ) {
  * - ON with Interrupt, duration set by interrupt
  * - OFF with after duration ends
 */
-void gatherMotion(bool stats = false ) { 
+void gatherMotion() { 
   if (gvLastMotion != gvMotion) {
     envNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF));
     Homie.getLogger() << (gvMotion ? pchmotionON : pchmotionOFF) << endl;
     gvLastMotion = gvMotion;
+
+  } 
+  if ( gulMotionDuration > guiTimeBase ) { 
+      gvLastMotion = gvMotion = false;
+      envNode.setProperty(PROP_MOTION).send(pchOFF);
+      Homie.getLogger() << pchmotionOFF << endl;
   }
 
-  if (stats) {
-    gvLastMotion = gvMotion = false;
-    envNode.setProperty(PROP_MOTION).send(pchOFF);
-    Homie.getLogger() << pchmotionOFF << endl;
-  }
   yield();
 }
 
@@ -346,6 +369,9 @@ void gatherTemps() {   // called every status interval
   
     snprintf(gcHumid, sizeof(gcHumid), "%.1f", gfHumidity);
     envNode.setProperty(PROP_HUM).send(gcHumid);      
+
+    snprintf(gcTemp, sizeof(gcTemp), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
+    Homie.getLogger << gcTemp << endl;
   }     
   gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
   yield();
@@ -375,7 +401,7 @@ void displaySensors() {
     display.display();
 
   } else {
-    if (gbDisplayOn) {
+    if ( gbDisplayOn && !gbLOXRunMode) {
       gbDisplayOn = false;
       display.displayOff();
     }
@@ -394,6 +420,8 @@ void sendSensorStats() {
   envNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF)); 
   doorNode.setProperty(PROP_ENTRY).send(String(giEntryCount));  
   doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
+  doorNode.setProperty(PROP_ACTION).send(gcDirection);
+
   yield();
 }
 
@@ -451,19 +479,17 @@ void homieLoopHandler() {
   guiTimeBase = millis();
   gvDuration = ((guiTimeBase - gulLastTimeBase) >= 500);
 
-  if (gvDuration && gulEntryDuration >= guiTimeBase ) {   // Every half second poll 
+  if ( gulEntryDuration >= guiTimeBase  ) {   // when enabled by operator
     gatherEntry(); 
   }
 
-  if (gvDuration && gulMotionDuration >= guiTimeBase ) {  // Interrupt Driven Handler
+  if ( gulMotionDuration >= guiTimeBase ) {  // duration hold the current value Interrupt Driven Handler
     gatherMotion();    
-  } else if (gvMotion && gvDuration) {
-    gatherMotion(true);  // turn off
   }
 
   gatherPosition(); // Interrupt Driven Handler
 
-  if (guiTimeBase >= gulTempsDuration ) {    
+  if (gulTempsDuration <= guiTimeBase ) {    
     gatherTemps();
   }
 
@@ -527,7 +553,7 @@ bool initializeRanging() {
 void homieSetupHandler() {
   Homie.getLogger() << "homieSetupHandler() running on core: " << xPortGetCoreID() << endl;
 
-  Wire.begin(PIN_SDA, PIN_SCL, 400000L);
+  Wire.begin(PIN_SDA, PIN_SCL, 400000UL);
   delay(50);
 
   dht.setup(PIN_DHT, DHTesp::DHT11);
@@ -598,6 +624,12 @@ void setup() {
             .setRetained(true)
             .setFormat("%d")
             .setUnit("#");
+
+  doorNode.advertise(PROP_ACTION)
+            .setName(PROP_ACTION_TITLE)
+            .setDatatype("string")
+            .setRetained(true)
+            .setFormat("%s");
 
   envNode.advertise(PROP_MOTION)
             .setName(PROP_MOTION_TITLE)

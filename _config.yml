@@ -1,0 +1,21 @@
+title: GarageProvider
+email: skoona@gmail.com
+description: > # this means to ignore newlines until "baseurl:"
+  Homie V3 based Garage Door Operator and Environment Multi-Sensor.
+baseurl: ""
+url: https://skoona.github.io/skn_sensors-garage_provider
+
+twitter_username: JamesScottiii
+twitter:
+  username: jamesscottiii
+
+theme: jekyll-theme-cayman
+
+github_username:  skoona
+github:
+  username:  skoona
+
+# paginate:     1
+author:
+  name:       "James Scott, Jr. (a.k.a Skoona)"
+  url:        https://keybase.io/skoona
