@@ -99,7 +99,7 @@
 #define PIN_ENTRY         36
 
 #define DHT_TYPE          DHT11
-#define ENTRY_VOLTAGE_BASE 0.65 // 0.065440348345433     // correction for voltage divider
+#define ENTRY_VOLTAGE_BASE 0.065440348345433     // correction for voltage divider
 
 /*
  * Sensor Values
@@ -204,14 +204,11 @@ void enableRanging(unsigned long durationMS) {
   gbLOXReady = false;
 
   lox.setDistanceMode( VL53L1X::Long );
-  delay(50);
   lox.setMeasurementTimingBudget( 150000 );
-  delay(50);
   lox.startContinuous( 150 ); // total should be around 250ms per reading
-  delay(50);
 
-  Homie.getLogger() << "VL53L1X getDistanceMode()=" <<  lox.getDistanceMode()  << endl;
-  Homie.getLogger() << "VL53L1X getMeasurementTimingBudget()=" <<  lox.getMeasurementTimingBudget()  << endl;
+  // Homie.getLogger() << "VL53L1X getDistanceMode()=" <<  lox.getDistanceMode()  << endl;
+  // Homie.getLogger() << "VL53L1X getMeasurementTimingBudget()=" <<  lox.getMeasurementTimingBudget()  << endl;
 
   gulRangingDuration = setDuration( durationMS );  // LOX read for 60 seconds   
   gbLOXRunMode   = true;                       // Release Ranging data collection routines
@@ -343,9 +340,8 @@ void gatherMotion() {
     envNode.setProperty(PROP_MOTION).send((gvMotion ? pchON : pchOFF));
     Homie.getLogger() << (gvMotion ? pchmotionON : pchmotionOFF) << endl;
     gvLastMotion = gvMotion;
-
   } 
-  if ( gulMotionDuration > guiTimeBase ) { 
+  if ( gvMotion && gulMotionDuration < guiTimeBase ) { 
       gvLastMotion = gvMotion = false;
       envNode.setProperty(PROP_MOTION).send(pchOFF);
       Homie.getLogger() << pchmotionOFF << endl;
@@ -371,7 +367,7 @@ void gatherTemps() {   // called every status interval
     envNode.setProperty(PROP_HUM).send(gcHumid);      
 
     snprintf(gcTemp, sizeof(gcTemp), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
-    Homie.getLogger << gcTemp << endl;
+    Homie.getLogger() << gcTemp << endl;
   }     
   gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
   yield();
@@ -483,7 +479,7 @@ void homieLoopHandler() {
     gatherEntry(); 
   }
 
-  if ( gulMotionDuration >= guiTimeBase ) {  // duration hold the current value Interrupt Driven Handler
+  if ( guiTimeBase <= gulMotionDuration ) {  // duration hold the current value Interrupt Driven Handler
     gatherMotion();    
   }
 
@@ -540,7 +536,7 @@ bool initializeRanging() {
     Serial.println("Failed to detect and initialize VL53L1X sensor! (2)");
     display.drawString(0, 48, "VL53L1X Failed!");
     display.display();
-    delay(2000);
+    delay(5000);
     ESP.restart();
   }
 
