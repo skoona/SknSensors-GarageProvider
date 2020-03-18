@@ -3,16 +3,16 @@
     "device_id": "GarageProvider",
   "device_stats_interval": 300,  
   "wifi": {
-    "ssid": "SFNSS1-24G",
-    "password": "Apache Tomcat 8"
+    "ssid": "<Your-WiFi-AP>",
+    "password": "<Your-WiFi-Password>"
   },
   "mqtt": {
-    "host": "openhab.skoona.net",
+    "host": "<Your-MQTT-Server>",
     "port": 1883,
-	"base_topic": "sknSensors/",
+	"base_topic": "homie/",
     "auth": true,
-    "username": "openhabian",
-    "password": "Apache.Tomcat.8"
+    "username": "<Your-MQTT-UserName>",
+    "password": "<Your-MQTT-Password>"
   },
   "ota": {
     "enabled": true
