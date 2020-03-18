@@ -90,4 +90,4 @@ Homie V3 based Garage Door Operator and Environment Multi-Sensor.
 
 ## License
 
-The gem is available as open source under the terms of the [MIT License](http://opensource.org/licenses/MIT).
+The project is available as open source under the terms of the [MIT License](http://opensource.org/licenses/MIT).
