@@ -44,14 +44,11 @@
     Updating VL53L1X                         @ 1.2.0          [Up-to-date]
  */
 
-#include <Arduino.h>
 #include <driver/adc.h>
-
 #include <Homie.h>
 
-#include <Wire.h>
 #include "SSD1306Wire.h"
-#include <VL53L1X.h>
+#include "VL53L1X.h"
 
 #include "DHTesp.h"
 
@@ -102,6 +99,11 @@
 #define ENTRY_VOLTAGE_BASE 0.065440348345433     // correction for voltage divider
 
 /*
+ * Wire.h Controll
+*/
+SemaphoreHandle_t xWireMutex;
+
+/*
  * Sensor Values
  */
 volatile unsigned long guiTimeBase   = 0,     // default time base, target 0.5 seconds
@@ -112,7 +114,7 @@ volatile unsigned long guiTimeBase   = 0,     // default time base, target 0.5 s
                   gulEntryDuration   = 0;     // time to run beam break monitor after door operates
 
 volatile int      giEntry            = 0,     // value of beam break ADC
-                  giEntryMax         = 2375,  // computed range 2426: 21.5v open value of ADC reading -- break
+                  giEntryMax         = 1700,  // computed range 2426: 21.5v open value of ADC reading -- break  405=5.07, 400=5.02v, 1600=20.08v
                   giEntryMin         = 2200,  // computed value 2256: 20.0v close value of ADC reading -- no break
                   giEntryCount       = 0,     // count of number of entries since startup
                   giLastEntry        = 10;    // ADC reading of last entry    
@@ -195,25 +197,36 @@ bool broadcastHandler(const String& level, const String& value) {
   return true;
 }
 
+void wireTake(String method) {
+  // Homie.getLogger() << "Mutex Requested By: " << method << endl;
+  xSemaphoreTake( xWireMutex, portMAX_DELAY );
+}
+void wireGive(String method) {
+  // Homie.getLogger() << "Mutex Returned By: " << method << endl;
+  xSemaphoreGive( xWireMutex );
+}
+
 /** 
  *  Re Enable VL53L1X after havin been ShutDown
 */
 void enableRanging(unsigned long durationMS) {
   Homie.getLogger() << "Restoring VL53L1X ranging. " << endl;
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
+  delay(100);
+
+  wireTake( "enableRanging()" );
+
   gbLOXReady = false;
 
-  lox.setDistanceMode( VL53L1X::Long );
+  lox.setDistanceMode( VL53L1X::Medium );
   lox.setMeasurementTimingBudget( 150000 );
-  lox.startContinuous( 150 ); // total should be around 250ms per reading
-
-  // Homie.getLogger() << "VL53L1X getDistanceMode()=" <<  lox.getDistanceMode()  << endl;
-  // Homie.getLogger() << "VL53L1X getMeasurementTimingBudget()=" <<  lox.getMeasurementTimingBudget()  << endl;
+  lox.startContinuous( 150 ); // total should be around 300ms per reading
 
   gulRangingDuration = setDuration( durationMS );  // LOX read for 60 seconds   
-  gbLOXRunMode   = true;                       // Release Ranging data collection routines
+  gbLOXRunMode   = true;                           // Release Ranging data collection routines
   Homie.getLogger() << "VL53L1X ranging enabled for " << (durationMS/1000.0) << " seconds." << endl;
-  delay(300);
+  wireGive( "enableRanging()" );
+  delay(500); // stablize I2c requires upto 300ms
 }
 
 /**
@@ -221,17 +234,14 @@ void enableRanging(unsigned long durationMS) {
 */
 bool operationsHandler(const HomieRange& range, const String& value) {
   Homie.getLogger() << "Operator Command: " << value << endl;
-  if (value == pchON || value == "true" || value == "on") {
+  if ( value.equalsIgnoreCase("true") || value.equalsIgnoreCase("on") )  {
     gulEntryDuration = setDuration( 900000UL ); // Wait 15 min for an entry
 
-    enableRanging(60000UL);                  // Enable Ranging
+    enableRanging(60000UL);             // Enable Ranging
 
     digitalWrite(PIN_RELAY, HIGH );     // activate door relay
       delay(750);
     digitalWrite(PIN_RELAY, LOW );      // de-activate door relay
-
-    // yield(); 
-    taskYIELD();
     doorNode.setProperty(PROP_RELAY).send( pchOFF );
 
     Homie.getLogger() << "Exit ON operation. " << endl;
@@ -254,12 +264,13 @@ void gatherPosition() {
     Homie.getLogger() << F("VL53L1X OFF~> Read: ") << giLastLOXValue 
                       << ", Raw: " << giLOX 
                       << endl;      
-    taskYIELD();
     return;
   } 
 
   if (gbLOXReady) {
+    wireTake( "gatherPosition()" );
     giLOX = lox.read(); // read data value
+
     if (!lox.timeoutOccurred() && giLOX > 1 && giLOX < 8100) {
                               
       if (giLOX < giLastLOXValue) { // moving up
@@ -272,8 +283,11 @@ void gatherPosition() {
         snprintf(gcDirection, sizeof(gcDirection), "%s", "CLOSED" );
       }
 
-      doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
-      doorNode.setProperty(PROP_ACTION).send(gcDirection);
+      doorNode.setProperty(PROP_POS).send(String(giLOX));
+
+      if (gvDuration) {
+        doorNode.setProperty(PROP_ACTION).send(gcDirection);
+      }
 
       Homie.getLogger() << F("VL53L1X Read: ") << giLastLOXValue 
                         << ", Raw: " << giLOX 
@@ -286,9 +300,8 @@ void gatherPosition() {
     } else {
       Homie.getLogger() << F("VL53L1X Timeout or Out of Range: ") << lox.last_status  << endl;
     }
+    wireGive( "gatherPosition()" );
   }   
-  
-  taskYIELD();
 }
 
 /**
@@ -308,6 +321,9 @@ double sknAdcToVolts(int value) {
   return ((reading + ENTRY_VOLTAGE_BASE) * 10.0); // scale to d.dd
 }
 
+/*
+ * Run for 15 min after door operations, on every loop cycle
+*/
 void gatherEntry( ) {
   /*
     * 4.9vdc produces a reading of 1058 ish 
@@ -317,7 +333,14 @@ void gatherEntry( ) {
     if (giEntry >= giEntryMax) {
       giEntryCount++;  
       doorNode.setProperty(PROP_ENTRY).send(String(giEntryCount));                                        
-      Homie.getLogger() << "Entries: " << giEntryCount 
+      Homie.getLogger() << F("SafetyBeam: ") << giEntryCount 
+                        << ", Volts: " << sknAdcToVolts(giEntry)
+                        << ", Raw: " << giEntry 
+                        << ", Min: " << giEntryMin
+                        << ", Max: " << giEntryMax << endl;
+    }
+    if (gvDuration) {
+      Homie.getLogger() << F("SafetyBeam: ") << giEntryCount 
                         << ", Volts: " << sknAdcToVolts(giEntry)
                         << ", Raw: " << giEntry 
                         << ", Min: " << giEntryMin
@@ -327,7 +350,15 @@ void gatherEntry( ) {
     giEntryMin = giEntry < giEntryMin ? giEntry : giEntryMin ;
     giLastEntry = giEntry;  
   }
-  yield();
+  if (gulEntryDuration < guiTimeBase) {
+    gulEntryDuration = 0;
+    Homie.getLogger() << F("SafteyBeam OFF~> : ") << giEntryCount 
+                        << ", Volts: " << sknAdcToVolts(giEntry)
+                        << ", Raw: " << giEntry 
+                        << ", Min: " << giEntryMin
+                        << ", Max: " << giEntryMax << endl;
+    return;
+  }
 }
 
 /**
@@ -341,13 +372,11 @@ void gatherMotion() {
     Homie.getLogger() << (gvMotion ? pchmotionON : pchmotionOFF) << endl;
     gvLastMotion = gvMotion;
   } 
-  if ( gvMotion && gulMotionDuration < guiTimeBase ) { 
+  if ( gvMotion && gulMotionDuration <= guiTimeBase ) { 
       gvLastMotion = gvMotion = false;
       envNode.setProperty(PROP_MOTION).send(pchOFF);
       Homie.getLogger() << pchmotionOFF << endl;
   }
-
-  yield();
 }
 
 /**
@@ -366,8 +395,8 @@ void gatherTemps() {   // called every status interval
     snprintf(gcHumid, sizeof(gcHumid), "%.1f", gfHumidity);
     envNode.setProperty(PROP_HUM).send(gcHumid);      
 
-    snprintf(gcTemp, sizeof(gcTemp), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
-    Homie.getLogger() << gcTemp << endl;
+    snprintf(gcTemps, sizeof(gcTemps), "%.1f °F, %.1f %%", gfTemperature, gfHumidity);
+    Homie.getLogger() << gcTemps << endl;
   }     
   gulTempsDuration = setDuration( 600000UL ); // Wait 10 min for next measurement
   yield();
@@ -379,7 +408,8 @@ void gatherTemps() {   // called every status interval
 */
 void displaySensors() {
   if (gvMotion) {
- 
+    wireTake( "displaySensors()" );
+
     if (!gbDisplayOn) {
       display.displayOn();
       gbDisplayOn = true;
@@ -396,13 +426,17 @@ void displaySensors() {
       display.drawString(0,48, gcEntry);
     display.display();
 
+    wireGive( "displaySensors()" );
+
   } else {
     if ( gbDisplayOn && !gbLOXRunMode) {
-      gbDisplayOn = false;
-      display.displayOff();
+      wireTake( "displaySensors()" );
+        gbDisplayOn = false;
+        display.displayOff();
+      wireGive( "displaySensors()" );
     }
   }
-  yield();
+  delay(10);
 }
 
 /**
@@ -418,11 +452,16 @@ void sendSensorStats() {
   doorNode.setProperty(PROP_POS).send(String(giLastLOXValue));
   doorNode.setProperty(PROP_ACTION).send(gcDirection);
 
-  yield();
+  Homie.getLogger() << "Environment: " << gcTemps << ", " 
+                    << (gvMotion ? pchmotionON : pchmotionOFF) << endl;
+  Homie.getLogger() << "Door Position: " << gcPosition << endl;
+  Homie.getLogger() << "Saftey Beam: " << gcEntry << endl;
 }
 
 void displayEvent(String eventName, String eventMessage) {
   if (gbDisplayInitialized) {
+    wireTake( "displayEvent()" );
+
     if(!gbDisplayOn) {
       display.displayOn();
       gbDisplayOn = true;
@@ -432,8 +471,9 @@ void displayEvent(String eventName, String eventMessage) {
       display.drawString(0,0, eventName);
       display.drawString(0,16, eventMessage);
     display.display();
+
+    wireGive( "displayEvent()" );
   }
-  yield();
 }
 
 void onHomieEvent(const HomieEvent& event) {
@@ -481,6 +521,8 @@ void homieLoopHandler() {
 
   if ( guiTimeBase <= gulMotionDuration ) {  // duration hold the current value Interrupt Driven Handler
     gatherMotion();    
+  } else {
+    gatherMotion();
   }
 
   gatherPosition(); // Interrupt Driven Handler
@@ -501,6 +543,8 @@ void homieLoopHandler() {
   * create fonts at http://oleddisplay.squix.ch/
 */ 
 void initializeDisplay() {
+  wireTake( "initializeDisplay()" );
+
   display.init();
   display.flipScreenVertically();
   display.clear();
@@ -511,7 +555,8 @@ void initializeDisplay() {
   display.drawString(0, 32, "0123456789ABC");
   display.display();
   gbDisplayInitialized = true;
-  yield();
+  delay(500);
+  wireGive( "initializeDisplay()" );
 }
 
 /**
@@ -520,6 +565,7 @@ void initializeDisplay() {
  * inter-measurement period in ms (e.g. sensor.startContinuous(250)).
 */
 bool initializeRanging() {
+  wireTake( "initializeRanging()");
   lox.setTimeout(500);
   gbValue = lox.init();
   lox.setTimeout(500);
@@ -540,10 +586,24 @@ bool initializeRanging() {
     ESP.restart();
   }
 
+  wireGive( "initializeRanging()" );
   enableRanging(2000UL);                // Enable Ranging
-  delay(500);
 
   return gbValue;
+}
+
+/*
+  * Voltage divider analog in pins
+  * https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
+  * set up A:D channels and attenuation
+  *   * Read the sensor by
+  *   * uint16_t value =  adc1_get_raw(ADC1_CHANNEL_0);
+  *  150mv-3.9vdc inside 0-4095 range   (constrained by 3.3vdc supply)
+*/
+void initializeADC() {
+  adc1_config_width(ADC_WIDTH_12Bit);
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // Pin 36
+  yield();
 }
 
 void homieSetupHandler() {
@@ -568,29 +628,23 @@ void setup() {
   Serial.println(xPortGetCoreID());
   yield();
 
+  xWireMutex = xSemaphoreCreateMutex(); // Prepare to coordinate access to Wire/I2c
   pinMode(PIN_ENTRY,  INPUT);     // analog sensor of IR door break 20.0vdc = off, 21.5vdc = on
   pinMode(PIN_MOTION, INPUT);     // RCWL sensor
   pinMode(PIN_L0X_INTR, INPUT);   // VL53L1X Interrupt Ready Pin
   pinMode(PIN_RELAY, OUTPUT);     // Door operator
   pinMode(PIN_L0X_SHDN, OUTPUT);  // VL53L1X Shutdown/Enable
+
   digitalWrite(PIN_RELAY, LOW);   // Init door to off
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
 
   /* Collect a few values for temps, entry. */
   gulTempsDuration = gulEntryDuration = setDuration( 2000UL );
 
-  /*
-   * Voltage divider analog in pins
-   * https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
-   * set up A:D channels and attenuation
-   *   * Read the sensor by
-   *   * uint16_t value =  adc1_get_raw(ADC1_CHANNEL_0);
-   *  150mv-3.9vdc inside 0-4095 range   (constrained by 3.3vdc supply)
-  */
-  adc1_config_width(ADC_WIDTH_12Bit);
-  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // Pin 36
-  yield();
-   
+  initializeADC();
+
+  Homie.setLedPin(LED_BUILTIN, HIGH);
+  
   Homie_setFirmware(SKN_MOD_NAME, SKN_MOD_VERSION);
   Homie_setBrand(SKN_MOD_BRAND);
   
