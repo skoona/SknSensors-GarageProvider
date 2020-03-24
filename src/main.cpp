@@ -202,8 +202,9 @@ void wireTake(String method) {
   xSemaphoreTake( xWireMutex, portMAX_DELAY );
 }
 void wireGive(String method) {
-  // Homie.getLogger() << "Mutex Returned By: " << method << endl;
+  // Homie.getLogger() << "Mutex Returned By: " << method << endl;  
   xSemaphoreGive( xWireMutex );
+  delay(100); 
 }
 
 /** 
@@ -213,20 +214,19 @@ void enableRanging(unsigned long durationMS) {
   Homie.getLogger() << "Restoring VL53L1X ranging. " << endl;
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
   delay(100);
-
+  
   wireTake( "enableRanging()" );
 
-  gbLOXReady = false;
+  gbLOXReady    = false;
 
   lox.setDistanceMode( VL53L1X::Medium );
   lox.setMeasurementTimingBudget( 150000 );
   lox.startContinuous( 150 ); // total should be around 300ms per reading
-
+  gbLOXRunMode  = true;                           // Release Ranging data collection routines
   gulRangingDuration = setDuration( durationMS );  // LOX read for 60 seconds   
-  gbLOXRunMode   = true;                           // Release Ranging data collection routines
+  delay(350); // stablize I2c requires upto 300ms
   Homie.getLogger() << "VL53L1X ranging enabled for " << (durationMS/1000.0) << " seconds." << endl;
   wireGive( "enableRanging()" );
-  delay(500); // stablize I2c requires upto 300ms
 }
 
 /**
@@ -515,6 +515,8 @@ void homieLoopHandler() {
   guiTimeBase = millis();
   gvDuration = ((guiTimeBase - gulLastTimeBase) >= 500);
 
+  gatherPosition(); // Interrupt Driven Handler
+
   if ( gulEntryDuration >= guiTimeBase  ) {   // when enabled by operator
     gatherEntry(); 
   }
@@ -524,8 +526,6 @@ void homieLoopHandler() {
   } else {
     gatherMotion();
   }
-
-  gatherPosition(); // Interrupt Driven Handler
 
   if (gulTempsDuration <= guiTimeBase ) {    
     gatherTemps();
@@ -643,7 +643,7 @@ void setup() {
 
   initializeADC();
 
-  Homie.setLedPin(LED_BUILTIN, HIGH);
+  // Homie.setLedPin(LED_BUILTIN, HIGH);
   
   Homie_setFirmware(SKN_MOD_NAME, SKN_MOD_VERSION);
   Homie_setBrand(SKN_MOD_BRAND);
@@ -652,7 +652,8 @@ void setup() {
       .setLoopFunction(homieLoopHandler)
       .setBroadcastHandler(broadcastHandler)
       .onEvent(onHomieEvent)  
-      .setSetupFunction(homieSetupHandler);
+      .setSetupFunction(homieSetupHandler)
+      .disableLedFeedback();
   
   doorNode.advertise(PROP_RELAY)
             .setName(PROP_RELAY_TITLE)
