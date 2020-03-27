@@ -51,6 +51,7 @@
 #include "VL53L1X.h"
 
 #include "DHTesp.h"
+#include "MedianFilterLib.h"
 
 #ifndef ESP32
 #pragma message(THIS MODULE IS FOR ESP32 ONLY!)
@@ -99,9 +100,14 @@
 #define ENTRY_VOLTAGE_BASE 0.065440348345433     // correction for voltage divider
 
 /*
- * Wire.h Controll
+ * Wire.h Control
 */
 SemaphoreHandle_t xWireMutex;
+
+/*
+ *
+*/
+MedianFilter<int> medianFilter(5);
 
 /*
  * Sensor Values
@@ -213,7 +219,7 @@ void wireGive(String method) {
 void enableRanging(unsigned long durationMS) {
   Homie.getLogger() << "Restoring VL53L1X ranging. " << endl;
   digitalWrite(PIN_L0X_SHDN, HIGH);   // H to enable, L to disable -- might also reset
-  delay(100);
+  vTaskDelay(100);
   
   wireTake( "enableRanging()" );
 
@@ -224,7 +230,7 @@ void enableRanging(unsigned long durationMS) {
   lox.startContinuous( 150 ); // total should be around 300ms per reading
   gbLOXRunMode  = true;                           // Release Ranging data collection routines
   gulRangingDuration = setDuration( durationMS );  // LOX read for 60 seconds   
-  delay(350); // stablize I2c requires upto 300ms
+  vTaskDelay(350); // stablize I2c requires upto 300ms
   Homie.getLogger() << "VL53L1X ranging enabled for " << (durationMS/1000.0) << " seconds." << endl;
   wireGive( "enableRanging()" );
 }
@@ -240,7 +246,7 @@ bool operationsHandler(const HomieRange& range, const String& value) {
     enableRanging(60000UL);             // Enable Ranging
 
     digitalWrite(PIN_RELAY, HIGH );     // activate door relay
-      delay(750);
+      vTaskDelay(750);
     digitalWrite(PIN_RELAY, LOW );      // de-activate door relay
     doorNode.setProperty(PROP_RELAY).send( pchOFF );
 
@@ -328,7 +334,7 @@ void gatherEntry( ) {
   /*
     * 4.9vdc produces a reading of 1058 ish 
     * should run inside doorPosition min/max limits   */    
-  giEntry = adc1_get_raw(ADC1_CHANNEL_0);
+  giEntry = medianFilter.AddValue( adc1_get_raw(ADC1_CHANNEL_0) );
   if ( giEntry != giLastEntry ) { // 20 to 21.5 volts, 
     if (giEntry >= giEntryMax) {
       giEntryCount++;  
